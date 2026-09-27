@@ -4,7 +4,7 @@
 id = "mycelium"
 name = "Mycelium"
 # The plugin's own version: the crate's (scripts/build-plugins.sh checks).
-version = "0.1.0"
+version = "0.1.1"
 summary = "Project memory your agents record as they work — findings, decisions, learnings."
 homepage = "https://github.com/arjunrajlaboratory/mycelium"
 # The chimaera:plugin WIT version the component targets.
@@ -13,11 +13,11 @@ api = "0.1"
 [detect]
 any = [".living/INDEX.md", ".living/learnings.md", ".living/findings", "MYCELIUM.md"]
 
-[requires.agent_plugins.claude]
+[recommends.agent_plugins.claude]
 id = "mycelium@mycelium"
 marketplace = "arjunrajlaboratory/mycelium"
 
-[requires.agent_plugins.codex]
+[recommends.agent_plugins.codex]
 id = "mycelium@mycelium"
 marketplace = "arjunrajlaboratory/mycelium"
 
