@@ -1,19 +1,24 @@
-# Mycelium — the Knowledge provider for workspaces that keep mycelium's
-# project memory, plus the agents' two read tools over it. Reads through the
-# host's bounded, symlink-refusing fs; never writes.
 [package]
 name = "chimaera-plugin-mycelium"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-repository.workspace = true
-publish.workspace = true
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+repository = "https://github.com/martinappberg/chimaera-plugin-mycelium"
+description = "Mycelium for Chimaera: the Knowledge provider for workspaces that keep mycelium's project memory (.living/), plus knowledge_search and knowledge_get for every agent."
+publish = false
 
 [lib]
 crate-type = ["cdylib"]
 
 [dependencies]
-chimaera-plugin-api.workspace = true
-# The snapshot types derive `Serialize` (serde_json comes re-exported by the
-# API crate); already in the graph through it, so nothing new is pulled in.
+# The chimaera:plugin WIT world and its Rust bindings, from the daemon's
+# repository, pinned to a commit so a release is reproducible (a crates.io
+# release of the API crate replaces this later).
+chimaera-plugin-api = { git = "https://github.com/martinappberg/chimaera.git", rev = "1121107370e162635b93eff3843f17f32f45f9fc" }
 serde = { version = "1", features = ["derive"] }
+# One small component: the daemon embeds or downloads it.
+[profile.release]
+lto = true
+strip = true
+codegen-units = 1
+opt-level = "s"

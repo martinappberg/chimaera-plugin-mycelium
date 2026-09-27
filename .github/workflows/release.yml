@@ -1,0 +1,43 @@
+# A tag `vX.Y.Z` builds the component and publishes a GitHub release carrying
+# plugin.wasm, plugin.toml and SHA256SUMS — the three files a Chimaera daemon
+# installs from (`chimaera plugin add owner/repo`, the Plugins tab, or the
+# daemon's own plugins.lock). The tag, Cargo.toml and plugin.toml must agree.
+name: release
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      # rust-toolchain.toml pins the channel and the wasm32-wasip2 target.
+      - run: rustup show
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: versions agree
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          crate="$(cargo pkgid | sed 's/.*[#@]//')"
+          manifest="$(grep -E '^version *= *"' plugin.toml | head -1 | cut -d'"' -f2)"
+          if [ "$tag" != "$crate" ] || [ "$tag" != "$manifest" ]; then
+            echo "tag v$tag, Cargo.toml $crate and plugin.toml $manifest must agree" >&2
+            exit 1
+          fi
+      - name: build the component
+        run: |
+          set -euo pipefail
+          cargo build --release --target wasm32-wasip2 --locked
+          mkdir -p dist
+          cp target/wasm32-wasip2/release/*.wasm dist/plugin.wasm
+          cp plugin.toml dist/plugin.toml
+          (cd dist && sha256sum plugin.wasm plugin.toml > SHA256SUMS && cat SHA256SUMS)
+      - name: publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/plugin.wasm dist/plugin.toml dist/SHA256SUMS \
+            --title "$GITHUB_REF_NAME" \
+            --notes "plugin.wasm (wasm32-wasip2), plugin.toml and SHA256SUMS for Chimaera. Install: chimaera plugin add ${GITHUB_REPOSITORY}"
