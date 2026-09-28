@@ -4,7 +4,7 @@
 id = "mycelium"
 name = "Mycelium"
 # The plugin's own version: the crate's (scripts/build-plugins.sh checks).
-version = "0.1.2"
+version = "0.1.3"
 summary = "Project memory your agents record as they work — findings, decisions, learnings."
 # A few plain sentences for the card, in the plugin author's words.
 description = "Mycelium is the Arjun Raj lab's living-repository framework: as agents work they record findings with their evidence, decisions and learnings in the repository's .living/ folder, so the project remembers what was learned and why. This plugin reads those files for the Knowledge view and gives every agent two read tools, knowledge_search and knowledge_get. It never writes."

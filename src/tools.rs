@@ -135,13 +135,19 @@ fn search(k: &Knowledge, query: &str, limit: usize) -> ToolResult {
     let mut hits: Vec<(usize, String)> = Vec::new();
     for topic in &k.topics {
         for f in &topic.findings {
+            let addenda: Vec<&str> = f
+                .addenda
+                .iter()
+                .flat_map(|a| [a.title.as_str(), a.text.as_str()])
+                .collect();
             let s = score(&format!(
-                "{} {} {} {} {}",
+                "{} {} {} {} {} {}",
                 f.id,
                 f.claim,
                 f.implications,
                 f.tags.join(" "),
-                f.questions.join(" ")
+                f.questions.join(" "),
+                addenda.join(" ")
             ));
             if s > 0 {
                 hits.push((
@@ -215,15 +221,21 @@ fn search(k: &Knowledge, query: &str, limit: usize) -> ToolResult {
 }
 
 /// knowledge_get {id} — one entry in full (a finding by F-id, a decision or
-/// learning by the id knowledge_search printed).
+/// learning by the id knowledge_search printed). An F-id a project wrote on
+/// more than one finding reads them all.
 fn get(k: &Knowledge, want: &str) -> ToolResult {
     let mut out = String::from(FRAME);
+    let mut found = false;
     for topic in &k.topics {
-        if let Some(f) = topic
+        for f in topic
             .findings
             .iter()
-            .find(|f| f.id.eq_ignore_ascii_case(want))
+            .filter(|f| f.id.eq_ignore_ascii_case(want))
         {
+            if found {
+                out.push('\n');
+            }
+            found = true;
             out.push_str(&format!(
                 "{} — {}\nstatus: {}\ntopic: {} ({}:{})\nimplications: {}\ntags: {}\n",
                 f.id,
@@ -235,6 +247,24 @@ fn get(k: &Knowledge, want: &str) -> ToolResult {
                 f.implications,
                 f.tags.join(", ")
             ));
+            if !f.addenda.is_empty() {
+                out.push_str("addenda:\n");
+                for a in &f.addenda {
+                    let sep = if a.title.is_empty() { "" } else { ": " };
+                    out.push_str(&format!(
+                        "  - {}{sep}{} (line {})\n",
+                        a.label, a.title, a.line
+                    ));
+                    for line in a.text.lines() {
+                        let line = line.trim_end();
+                        if line.is_empty() {
+                            out.push('\n');
+                        } else {
+                            out.push_str(&format!("    {line}\n"));
+                        }
+                    }
+                }
+            }
             if !f.ledger.is_empty() {
                 out.push_str("evidence:\n");
                 for r in &f.ledger {
@@ -250,8 +280,10 @@ fn get(k: &Knowledge, want: &str) -> ToolResult {
                     out.push_str(&format!("  - {q}\n"));
                 }
             }
-            return ToolResult::text(out);
         }
+    }
+    if found {
+        return ToolResult::text(out);
     }
     if let Some(d) = k.decisions.iter().find(|d| d.fp == want) {
         out.push_str(&format!(
@@ -311,6 +343,101 @@ mod tests {
         assert_eq!(
             result.text,
             "no entry F-001 — knowledge_search lists ids (F-003 for findings)"
+        );
+    }
+
+    #[test]
+    fn a_reused_finding_id_reads_every_finding() {
+        use crate::reader::{Finding, Topic};
+        let finding = |claim: &str, line: u32| Finding {
+            id: "F-038".to_string(),
+            claim: claim.to_string(),
+            status: "robust".to_string(),
+            line,
+            ..Finding::default()
+        };
+        let k = Knowledge {
+            topics: vec![Topic {
+                slug: "ambient".to_string(),
+                path: ".living/findings/ambient.md".to_string(),
+                findings: vec![finding("Lane-specific", 3), finding("Changes markers", 9)],
+                ..Topic::default()
+            }],
+            ..Knowledge::default()
+        };
+        let result = Ask::parse("knowledge_get", &json!({"id": "f-038"}))
+            .unwrap()
+            .answer(&k);
+        assert!(!result.is_error);
+        let block = |claim: &str, line: u32| {
+            format!(
+                "F-038 — {claim}\nstatus: robust\ntopic: ambient \
+                 (.living/findings/ambient.md:{line})\nimplications: \ntags: \n"
+            )
+        };
+        assert_eq!(
+            result.text,
+            format!(
+                "{FRAME}{}\n{}",
+                block("Lane-specific", 3),
+                block("Changes markers", 9)
+            )
+        );
+    }
+
+    #[test]
+    fn a_findings_addenda_are_read_and_searched() {
+        use crate::reader::{Addendum, Finding, Topic};
+        let k = Knowledge {
+            topics: vec![Topic {
+                slug: "data".to_string(),
+                path: ".living/findings/data.md".to_string(),
+                findings: vec![Finding {
+                    id: "F-027".to_string(),
+                    claim: "CUIMC2 is complete".to_string(),
+                    status: "supported".to_string(),
+                    addenda: vec![
+                        Addendum {
+                            label: "Addendum".to_string(),
+                            title: "genotype readiness".to_string(),
+                            text: "238/240 donors.\n\nTwo re-queued.".to_string(),
+                            line: 12,
+                        },
+                        Addendum {
+                            label: "Addendum (2)".to_string(),
+                            title: String::new(),
+                            text: "Pileup tracks BAM reads.".to_string(),
+                            line: 20,
+                        },
+                    ],
+                    line: 3,
+                    ..Finding::default()
+                }],
+                ..Topic::default()
+            }],
+            ..Knowledge::default()
+        };
+        let get = Ask::parse("knowledge_get", &json!({"id": "F-027"}))
+            .unwrap()
+            .answer(&k);
+        assert_eq!(
+            get.text,
+            format!(
+                "{FRAME}F-027 — CUIMC2 is complete\nstatus: supported\ntopic: data \
+                 (.living/findings/data.md:3)\nimplications: \ntags: \naddenda:\n  \
+                 - Addendum: genotype readiness (line 12)\n    238/240 donors.\n\n    \
+                 Two re-queued.\n  - Addendum (2) (line 20)\n    Pileup tracks BAM reads.\n"
+            )
+        );
+        let search = Ask::parse("knowledge_search", &json!({"query": "pileup"}))
+            .unwrap()
+            .answer(&k);
+        assert!(
+            search
+                .text
+                .contains("- F-027 [supported] CUIMC2 is complete (topic data)"),
+            "{}",
+            search.text
         );
     }
 
