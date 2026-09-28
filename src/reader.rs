@@ -11,9 +11,12 @@
 //!   `### Open Questions`), decisions and learnings (`### [YYYY-MM-DD] Title`
 //!   at column 1 + `**Field**:` lines), `todo/TODO_REGISTRY.md`, and the
 //!   `.mycelium/last-session.md` handoff (either schema mycelium's
-//!   `finalize_handoff.py` accepts). Parsing matches what mycelium writes and
-//!   is lenient beyond it: malformed input degrades to fewer items plus a
-//!   `warnings` line. It never errors and never panics.
+//!   `finalize_handoff.py` accepts). An `F-NNN addendum…` heading
+//!   (`##`–`####`) is one of finding F-NNN's `addenda`, not another finding
+//!   with its id.
+//!   Parsing matches what mycelium writes and is lenient beyond it: malformed
+//!   input degrades to fewer items plus a `warnings` line. It never errors
+//!   and never panics.
 //! - **Fence-aware.** Headings and fields inside ``` / ~~~ fences (the
 //!   CommonMark rules of mycelium's `markdown_fences.py`) or HTML comments are
 //!   content, not entries. mycelium's own `collect_entries` is not
@@ -29,6 +32,7 @@
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::ops::Range;
 
 use chimaera_plugin_api::Stat;
 use serde::Serialize;
@@ -62,6 +66,8 @@ const MAX_LEDGER_ROWS: usize = 50;
 const MAX_TEXT_BYTES: usize = 2 * 1024;
 const MAX_TAGS: usize = 20;
 const MAX_QUESTIONS_PER_FINDING: usize = 20;
+/// Addenda kept per finding: the newest, since they append.
+const MAX_ADDENDA: usize = 50;
 /// Items kept per list (handoff blockers / next steps, a decision's
 /// alternatives).
 const MAX_LIST_ITEMS: usize = 50;
@@ -144,10 +150,27 @@ pub(crate) struct Finding {
     pub(crate) tags: Vec<String>,
     pub(crate) ledger: Vec<LedgerRow>,
     pub(crate) questions: Vec<String>,
+    /// Follow-ups written under `F-NNN addendum…` headings, in file order.
+    /// Their evidence rows, open questions and tags are the finding's own.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) addenda: Vec<Addendum>,
     /// 1-based line of the `F-` heading, for "open in file".
     pub(crate) line: u32,
     /// Newest ledger date, else the topic's `last_updated`.
     pub(crate) updated: String,
+}
+
+#[derive(Serialize, Clone, Debug, Default)]
+pub(crate) struct Addendum {
+    /// The heading's word and qualifier, e.g. "Addendum (2)".
+    pub(crate) label: String,
+    /// The heading after its separator; may be empty.
+    pub(crate) title: String,
+    /// Markdown, as written, less what the finding took: Status and Tags
+    /// lines, Evidence and Open questions subsections.
+    pub(crate) text: String,
+    /// 1-based line of its heading.
+    pub(crate) line: u32,
 }
 
 #[derive(Serialize, Clone, Debug, Default)]
@@ -1552,10 +1575,17 @@ struct Fields<'a> {
 }
 
 impl<'a> Fields<'a> {
-    fn parse(doc: &Doc<'a>, start: usize, end: usize, known: &[&str]) -> Self {
+    /// Over `ranges` of lines, each read as if the others weren't there.
+    fn parse(doc: &Doc<'a>, ranges: &[Range<usize>], known: &[&str]) -> Self {
         let mut list: Vec<(String, Vec<Cow<'a, str>>)> = Vec::new();
+        let lines = ranges
+            .iter()
+            .flat_map(|r| (r.start..r.end.min(doc.lines.len())).map(move |i| (i, i == r.start)));
         let mut current = false;
-        for i in start..end.min(doc.lines.len()) {
+        for (i, first) in lines {
+            if first {
+                current = false;
+            }
             let line = doc.lines[i];
             match doc.marks[i] {
                 Mark::Comment => continue,
@@ -1800,7 +1830,8 @@ fn parse_decisions(text: &str, rel: &str, notes: &mut Notes) -> Vec<Decision> {
     select_entries(&doc, rel, "decision", notes)
         .into_iter()
         .map(|(span, fp)| {
-            let fields = Fields::parse(&doc, span.start + 1, span.end, DECISION_FIELDS);
+            let body = span.start + 1..span.end;
+            let fields = Fields::parse(&doc, std::slice::from_ref(&body), DECISION_FIELDS);
             Decision {
                 fp,
                 date: span.date.to_owned(),
@@ -1827,7 +1858,8 @@ fn parse_learnings(text: &str, rel: &str, notes: &mut Notes) -> Vec<Learning> {
     select_entries(&doc, rel, "learning", notes)
         .into_iter()
         .map(|(span, fp)| {
-            let fields = Fields::parse(&doc, span.start + 1, span.end, LEARNING_FIELDS);
+            let body = span.start + 1..span.end;
+            let fields = Fields::parse(&doc, std::slice::from_ref(&body), LEARNING_FIELDS);
             let category = fields
                 .get(&["category"])
                 .and_then(|lines| lines.first())
@@ -1891,9 +1923,156 @@ fn subsection(text: &str) -> Subsection {
     }
 }
 
-/// A topic file's findings — at most `budget` of them, the lowest ids — and
-/// how many `F-` headings the file has in all (for the cap warning). `None`
-/// for a file with no findings (or none left in the budget).
+/// What follows `F-NNN` in an addendum's heading — `addendum: title`,
+/// `Addendum (2) — title`, `addendum 2 - title`, a bare `addendum` — as the
+/// label to show (`Addendum (2)`) and the title. The word may carry one
+/// qualifier (parenthesized, or a token without letters), then only a
+/// separator or nothing: a claim that merely opens with the word ("Addendum
+/// to protocol v2 improves yield") is a finding.
+fn addendum_heading(rest: &str) -> Option<(String, &str)> {
+    let word = ["addendum", "addenda"]
+        .into_iter()
+        .find(|w| {
+            rest.get(..w.len())
+                .is_some_and(|head| head.eq_ignore_ascii_case(w))
+        })?
+        .len();
+    // A separator and what follows it, or nothing at all.
+    fn title(t: &str) -> Option<&str> {
+        let t = t.trim_start().trim_start_matches('*').trim_start();
+        if t.is_empty() {
+            return Some(t);
+        }
+        t.strip_prefix([':', '—', '–']).or_else(|| {
+            t.strip_prefix('-')
+                .filter(|r| r.starts_with(char::is_whitespace))
+        })
+    }
+    let after = &rest[word..];
+    let (qualifier, title) = match title(after) {
+        Some(title) => ("", title),
+        None => {
+            let t = after.trim_start();
+            let (qualifier, tail) = match t.strip_prefix('(') {
+                Some(inner) => {
+                    let close = inner.find(')')?;
+                    (&t[..close + 2], &inner[close + 1..])
+                }
+                None => {
+                    let end = t
+                        .find(|c: char| c.is_whitespace() || matches!(c, ':' | '—' | '–' | '*'))
+                        .unwrap_or(t.len());
+                    if t[..end].chars().any(char::is_alphabetic) {
+                        return None;
+                    }
+                    t.split_at(end)
+                }
+            };
+            (qualifier, title(tail)?)
+        }
+    };
+    let mut label = rest[..word].to_owned();
+    label[..1].make_ascii_uppercase();
+    if !qualifier.is_empty() {
+        label.push(' ');
+        label.push_str(qualifier);
+    }
+    Some((label, title.trim().trim_matches('*').trim()))
+}
+
+/// Where the section a heading opens ends: at the next heading above its
+/// level, or at its level unless that is one of a `###` (or deeper)
+/// heading's own subsections (Evidence, Open questions) — never past
+/// `limit`.
+fn section_end(doc: &Doc, line: usize, level: usize, limit: usize) -> usize {
+    (line + 1..limit)
+        .find(|&i| {
+            doc.text(i).and_then(heading).is_some_and(|(l, text)| {
+                l < level || (l == level && (l <= 2 || subsection(text) == Subsection::Other))
+            })
+        })
+        .unwrap_or(limit)
+}
+
+/// An addendum's heading and lines, for [`parse_finding`].
+struct AddendumSpan<'t> {
+    label: String,
+    title: &'t str,
+    /// 0-based heading line.
+    line: usize,
+    /// Its lines after the heading.
+    body: Range<usize>,
+}
+
+/// An addendum's text as written, less what the finding takes — its Status
+/// and Tags lines, its Evidence and Open questions subsections — and
+/// comments. Its own sub-headings become bold lines.
+fn addendum_text(doc: &Doc, body: &Range<usize>) -> String {
+    let mut lines: Vec<Cow<str>> = Vec::new();
+    let mut section = Subsection::Other;
+    let mut tag_list = false;
+    for i in body.clone() {
+        let line = doc.lines[i];
+        match doc.marks[i] {
+            Mark::Comment => continue,
+            Mark::Code => {
+                if section == Subsection::Other {
+                    lines.push(Cow::Borrowed(line));
+                }
+                continue;
+            }
+            Mark::Text => {}
+        }
+        if let Some((_, text)) = heading(line) {
+            section = subsection(text);
+            tag_list = false;
+            if section == Subsection::Other && !text.is_empty() {
+                lines.extend([
+                    Cow::Borrowed(""),
+                    Cow::Owned(format!("**{text}**")),
+                    Cow::Borrowed(""),
+                ]);
+            }
+            continue;
+        }
+        if is_thematic_break(line) {
+            section = Subsection::Other;
+            tag_list = false;
+            continue;
+        }
+        let field = field_line(line, FINDING_FIELDS);
+        if field.is_some() {
+            tag_list = false;
+        }
+        match field {
+            Some((label, _)) if label == "status" => continue,
+            // `**Tags**:` over a bullet list: the bullets are the tags.
+            Some((label, value)) if label == "tags" => {
+                tag_list = value.is_empty();
+                continue;
+            }
+            _ => {}
+        }
+        if tag_list && (line.trim().is_empty() || list_marker(line.trim_start()).is_some()) {
+            continue;
+        }
+        tag_list = false;
+        if section != Subsection::Other {
+            continue;
+        }
+        let stripped = strip_inline_comments(line);
+        if stripped.trim().is_empty() && !line.trim().is_empty() {
+            continue;
+        }
+        lines.push(stripped);
+    }
+    tidy(&lines)
+}
+
+/// A topic file's findings — at most `budget` of them, the lowest ids, each
+/// with its addenda — and how many the file has in all (for the cap
+/// warning). `None` for a file with no findings (or none left in the
+/// budget).
 fn parse_topic(
     text: &str,
     rel: &str,
@@ -1913,81 +2092,186 @@ fn parse_topic(
 
     struct Head<'t> {
         line: usize,
-        /// The next `F-` heading's line (or EOF): the finding can't pass it.
-        limit: usize,
         level: usize,
+        /// The next `F-` heading's line (or EOF): no span passes it.
+        limit: usize,
+        /// A finding's: the next finding's line (or EOF). Its span runs over
+        /// the addenda before that, which are cut out of it.
+        reach: usize,
         id: String,
         num: u64,
         claim: &'t str,
+        /// An addendum's label and title.
+        addendum: Option<(String, &'t str)>,
     }
+    let eof = doc.lines.len();
     let mut heads: Vec<Head> = Vec::new();
-    let mut found = 0usize;
+    let mut total = 0usize;
+    let mut open_finding: Option<usize> = None;
     let mut title: Option<&str> = None;
-    for i in 0..doc.lines.len() {
+    for i in 0..eof {
         let Some((level, text)) = doc.text(i).and_then(heading) else {
             continue;
         };
         if level == 1 && title.is_none() {
             title = Some(text);
         }
-        let (2 | 3, Some((id, num, claim))) = (level, finding_id(text)) else {
+        let Some((id, num, claim)) = finding_id(text) else {
             continue;
         };
-        found += 1;
-        if let Some(last) = heads.last_mut().filter(|h| h.limit == doc.lines.len()) {
+        let addendum = addendum_heading(claim);
+        if !(matches!(level, 2 | 3) || (level == 4 && addendum.is_some())) {
+            continue;
+        }
+        total += 1;
+        if let Some(last) = heads.last_mut().filter(|h| h.limit == eof) {
             last.limit = i;
         }
+        if addendum.is_none() {
+            if let Some(k) = open_finding.take() {
+                heads[k].reach = i;
+            }
+        }
         if heads.len() < MAX_SCANNED_ENTRIES {
+            if addendum.is_none() {
+                open_finding = Some(heads.len());
+            }
             heads.push(Head {
                 line: i,
-                limit: doc.lines.len(),
                 level,
+                limit: eof,
+                reach: eof,
                 id,
                 num,
                 claim,
+                addendum,
             });
         }
     }
-    if found > MAX_SCANNED_ENTRIES {
+    if total > MAX_SCANNED_ENTRIES {
         notes.push(format!(
-            "{rel}: {found} findings; only the first {MAX_SCANNED_ENTRIES} were considered"
+            "{rel}: {total} finding headings; only the first {MAX_SCANNED_ENTRIES} were considered"
         ));
     }
-    // Stable: a duplicated id keeps file order.
-    heads.sort_by_key(|h| h.num);
-    heads.truncate(budget);
-    if heads.is_empty() {
+
+    // Each finding with its addenda, as indexes into `heads`. An addendum
+    // belongs to the latest finding above it with its id; with none, it
+    // leads until its finding appears (written below it) or the file ends
+    // (the finding is elsewhere, or nowhere). A reused id is two findings.
+    struct Group {
+        finding: Option<usize>,
+        /// Never empty without a finding.
+        addenda: Vec<usize>,
+    }
+    impl Group {
+        /// The heading the finding is shown at.
+        fn lead(&self) -> usize {
+            self.finding.unwrap_or_else(|| self.addenda[0])
+        }
+    }
+    let mut groups: Vec<Group> = Vec::new();
+    let mut latest: HashMap<&str, usize> = HashMap::new();
+    for (k, head) in heads.iter().enumerate() {
+        let group = latest.get(head.id.as_str()).map(|&g| &mut groups[g]);
+        match (head.addendum.is_some(), group) {
+            (true, Some(group)) => group.addenda.push(k),
+            (false, Some(group)) if group.finding.is_none() => group.finding = Some(k),
+            (addendum, group) => {
+                if let Some(first) = group.and_then(|g| g.finding) {
+                    notes.push(format!(
+                        "{rel}: {} at line {} reuses the id of the finding at line {}; both are shown",
+                        head.id,
+                        line_no(head.line),
+                        line_no(heads[first].line)
+                    ));
+                }
+                latest.insert(&head.id, groups.len());
+                groups.push(if addendum {
+                    Group {
+                        finding: None,
+                        addenda: vec![k],
+                    }
+                } else {
+                    Group {
+                        finding: Some(k),
+                        addenda: Vec::new(),
+                    }
+                });
+            }
+        }
+    }
+    for group in groups.iter().filter(|g| g.finding.is_none()) {
+        let head = &heads[group.lead()];
+        notes.push(format!(
+            "{rel}: the {id} addendum at line {} has no {id} finding in this file; shown on its own",
+            line_no(head.line),
+            id = head.id
+        ));
+    }
+    // Headings past the scan cap count as findings, unexamined.
+    let found = groups.len() + (total - heads.len());
+    // Stable: a reused id keeps file order.
+    groups.sort_by_key(|g| heads[g.lead()].num);
+    groups.truncate(budget);
+    if groups.is_empty() {
         return (None, found);
     }
 
     let last_updated = meta("last_updated")
         .filter(|v| v.as_bytes().get(..10).is_some_and(is_iso_date))
         .map(|v| v[..10].to_owned());
-    let findings = heads
+    let span = |head: &Head| head.line + 1..section_end(&doc, head.line, head.level, head.limit);
+    let findings = groups
         .iter()
-        .map(|head| {
-            // A `## F-` finding runs to the next `#`/`##` heading; a `### F-`
-            // one also stops at a `###` that isn't one of its subsections.
-            let end = (head.line + 1..head.limit)
-                .find(|&i| {
-                    doc.text(i).and_then(heading).is_some_and(|(level, text)| {
-                        level <= 2
-                            || (head.level == 3
-                                && level == 3
-                                && subsection(text) == Subsection::Other)
-                    })
+        .map(|group| {
+            let mut own = Vec::new();
+            let lead = match group.finding {
+                Some(k) => {
+                    // A `## F-` finding runs to the next `#`/`##` heading; a
+                    // `### F-` one also stops at a `###` that isn't one of its
+                    // subsections. Addenda written inside it (of any id) are
+                    // cut out.
+                    let head = &heads[k];
+                    let end = section_end(&doc, head.line, head.level, head.reach);
+                    let mut from = head.line + 1;
+                    let inside = heads[k + 1..]
+                        .iter()
+                        .take_while(|h| h.addendum.is_some() && h.line < end);
+                    for inner in inside {
+                        own.push(from..inner.line);
+                        from = span(inner).end.min(end);
+                    }
+                    own.push(from..end);
+                    head
+                }
+                // No finding in the file: the first addendum stands in for
+                // it, its heading the claim.
+                None => &heads[group.lead()],
+            };
+            let parts: Vec<AddendumSpan> = group
+                .addenda
+                .iter()
+                .map(|&k| {
+                    let head = &heads[k];
+                    let (label, title) = head.addendum.clone().unwrap_or_default();
+                    AddendumSpan {
+                        label,
+                        title,
+                        line: head.line,
+                        body: span(head),
+                    }
                 })
-                .unwrap_or(head.limit);
+                .collect();
             let mut finding = parse_finding(
                 &doc,
-                head.line,
-                end,
-                &head.id,
-                head.claim,
+                &own,
+                &parts,
+                &lead.id,
+                lead.claim,
                 last_updated.as_deref(),
                 notes,
             );
-            finding.line = line_no(head.line);
+            finding.line = line_no(lead.line);
             finding
         })
         .collect();
@@ -2005,31 +2289,42 @@ fn parse_topic(
     (Some(topic), found)
 }
 
+/// A finding from its own lines (`own`: its span less the addenda written
+/// inside it) and its addenda, in file order. Claim, status and
+/// implications are the finding's own; each addendum adds its tags, evidence
+/// rows and open questions — and its status, when the finding states none
+/// (the newest one stated wins) — and is listed with its text.
 fn parse_finding(
     doc: &Doc,
-    head: usize,
-    end: usize,
+    own: &[Range<usize>],
+    addenda: &[AddendumSpan],
     id: &str,
     heading_claim: &str,
     last_updated: Option<&str>,
     notes: &mut Notes,
 ) -> Finding {
-    let fields = Fields::parse(doc, head + 1, end, FINDING_FIELDS);
+    let fields = Fields::parse(doc, own, FINDING_FIELDS);
+    // In file order across the finding and its addenda: ledgers append, and
+    // the newest rows are the ones kept.
+    let mut spans: Vec<&Range<usize>> = own.iter().chain(addenda.iter().map(|a| &a.body)).collect();
+    spans.sort_by_key(|span| span.start);
     let mut ledger_lines = Vec::new();
     let mut question_lines = Vec::new();
-    let mut section = Subsection::Other;
-    for i in head + 1..end {
-        let Some(line) = doc.text(i) else {
-            continue;
-        };
-        if let Some((_, text)) = heading(line) {
-            section = subsection(text);
-        } else if is_thematic_break(line) {
-            section = Subsection::Other;
-        } else if section == Subsection::Ledger {
-            ledger_lines.push(line);
-        } else if section == Subsection::Questions {
-            question_lines.push(line);
+    for span in spans {
+        let mut section = Subsection::Other;
+        for i in span.clone() {
+            let Some(line) = doc.text(i) else {
+                continue;
+            };
+            if let Some((_, text)) = heading(line) {
+                section = subsection(text);
+            } else if is_thematic_break(line) {
+                section = Subsection::Other;
+            } else if section == Subsection::Ledger {
+                ledger_lines.push(line);
+            } else if section == Subsection::Questions {
+                question_lines.push(line);
+            }
         }
     }
 
@@ -2063,18 +2358,49 @@ fn parse_finding(
     } else {
         cap_text(heading_claim.to_owned())
     };
-    let status = fields
+    let mut status = fields
         .get(&["status"])
         .and_then(|lines| lines.first())
         .map_or_else(|| "unknown".to_owned(), |v| normalize_status(v));
+    let stated = status != "unknown";
+    let mut tags = fields.tags();
+    for addendum in addenda {
+        let its = Fields::parse(doc, std::slice::from_ref(&addendum.body), FINDING_FIELDS);
+        let said = its
+            .get(&["status"])
+            .and_then(|lines| lines.first())
+            .map(|v| normalize_status(v));
+        if let Some(said) = said.filter(|s| !stated && s != "unknown") {
+            status = said;
+        }
+        for tag in its.tags() {
+            push_tag(&tag, &mut tags);
+        }
+    }
+    if addenda.len() > MAX_ADDENDA {
+        notes.push(format!(
+            "{id}: showing the newest {MAX_ADDENDA} of {} addenda",
+            addenda.len()
+        ));
+    }
+    let listed = addenda[addenda.len().saturating_sub(MAX_ADDENDA)..]
+        .iter()
+        .map(|addendum| Addendum {
+            label: cap_text(addendum.label.clone()),
+            title: cap_text(addendum.title.to_owned()),
+            text: cap_text(addendum_text(doc, &addendum.body)),
+            line: line_no(addendum.line),
+        })
+        .collect();
     Finding {
         id: id.to_owned(),
         claim,
         status,
         implications: fields.text(&["implications"]),
-        tags: fields.tags(),
+        tags,
         ledger: ledger.rows.into(),
         questions,
+        addenda: listed,
         line: 0,
         updated,
     }
@@ -3733,5 +4059,351 @@ SESSION RESUME — Last session (2026-09-15 17:40):
         ] {
             assert!(!says_none(real), "{real}");
         }
+    }
+
+    /// The layout real repositories write: addenda as `###`/`####`
+    /// sub-headings carrying the finding's id, one filed under the wrong
+    /// finding, a reused id, and addenda with no finding in the file.
+    const ADDENDA: &str = r#"---
+topic: data-completeness
+description: Which cohorts' data are complete and ready.
+last_updated: 2026-07-21
+---
+
+# Data completeness
+
+## F-027: Missing-data forensics across all cohorts (2026-07-15) — CUIMC2 is COMPLETE …
+**Status:** supported
+**Claim:** Every cohort's raw data is accounted for.
+**Implications:** Nothing needs re-requesting from CUIMC.
+**Tags:** f-027, data-completeness
+
+### Evidence Ledger
+| Date | Run/Session | Dataset | Project | Result | Direction |
+|---|---|---|---|---|---|
+| 2026-07-15 | run-40 | cuimc2 | pd | every cohort accounted for | supports |
+
+### F-027 addendum: CUIMC2 genotype readiness — 238/240 donors covered …
+Two donors lack genotype calls; both are re-queued.
+**Tags:** genotyping, f-027
+
+#### F-027 addendum: bulk DLPFC reads are PRESENT …
+The bulk DLPFC FASTQs were on the archive tier, not missing.
+
+### F-027 addendum (2): CUIMC2 demux pileup bottleneck is the BAM READ COUNT …
+**Status:** robust
+Pileup time tracks reads per BAM, not donor count.
+
+#### Evidence
+| Date | Run/Session | Dataset | Project | Result | Direction |
+|---|---|---|---|---|---|
+| 2026-07-20 | run-44 | cuimc2 | pd | pileup time tracks reads | refines |
+
+#### Open Questions
+- Would downsampling BAMs keep demux accuracy?
+
+## F-028: Sample swaps are rare
+**Status:** preliminary
+
+#### F-028 Addendum — one swap found in batch 3
+A single swap, fixed at the source.
+
+### Evidence Ledger
+| Date | Run/Session | Dataset | Project | Result | Direction |
+|---|---|---|---|---|---|
+| 2026-07-18 | run-42 | batch-3 | pd | one swap in 96 | supports |
+
+### F-027 addendum (3): late
+Filed under F-028 by mistake.
+
+## F-038: Ambient RNA is lane-specific
+**Status:** robust
+
+## F-038: Ambient RNA correction changes marker calls
+**Status:** preliminary
+
+### F-038 addendum: holds with SoupX too
+Checked with SoupX 1.6.
+
+## F-041 addendum: an addendum with no finding in this file
+**Status:** preliminary
+A stray note.
+
+### F-041 addendum (2): still stray
+**Status:** robust
+Another.
+
+## F-050: Addendum-free protocols replicate
+**Status:** robust
+
+### F-060 addendum (early): written above its finding
+**Tags**:
+- early
+- f-060
+
+Seen first in the pilot.
+
+## F-051: Addendum to protocol v2 improves yield
+**Status:** preliminary
+**Implications:** Switch the pilot to v2.
+
+## F-060: Pilot libraries replicate
+**Status:** supported
+"#;
+
+    #[test]
+    fn an_addendum_is_part_of_its_finding() {
+        let fx = Fixture::new("addenda");
+        fx.write(".living/findings/data-completeness.md", ADDENDA);
+        let k = read(fx.root());
+        let line_of = |start: &str| {
+            let at = ADDENDA.split('\n').position(|l| l.starts_with(start));
+            line_no(at.unwrap_or_else(|| panic!("no line {start:?}")))
+        };
+        let findings = &k.topics[0].findings;
+        let ids: Vec<&str> = findings.iter().map(|f| f.id.as_str()).collect();
+        // One finding per id, except the id written on two different findings.
+        assert_eq!(
+            ids,
+            ["F-027", "F-028", "F-038", "F-038", "F-041", "F-050", "F-051", "F-060"]
+        );
+        assert_eq!(k.counts.findings, 8);
+
+        let listed = |f: &Finding| -> Vec<(String, String, String, u32)> {
+            f.addenda
+                .iter()
+                .map(|a| (a.label.clone(), a.title.clone(), a.text.clone(), a.line))
+                .collect()
+        };
+        let entry = |label: &str, title: &str, text: &str, line: u32| {
+            (label.to_owned(), title.to_owned(), text.to_owned(), line)
+        };
+
+        // Every addendum belongs to the latest finding above it with its id,
+        // wherever it was filed, and is listed in file order.
+        let f27 = &findings[0];
+        assert_eq!(
+            f27.claim,
+            "Missing-data forensics across all cohorts (2026-07-15) — CUIMC2 is COMPLETE …"
+        );
+        assert_eq!(f27.line, line_of("## F-027"));
+        assert_eq!(f27.implications, "Nothing needs re-requesting from CUIMC.");
+        assert_eq!(
+            listed(f27),
+            [
+                entry(
+                    "Addendum",
+                    "CUIMC2 genotype readiness — 238/240 donors covered …",
+                    "Two donors lack genotype calls; both are re-queued.",
+                    line_of("### F-027 addendum: CUIMC2"),
+                ),
+                entry(
+                    "Addendum",
+                    "bulk DLPFC reads are PRESENT …",
+                    "The bulk DLPFC FASTQs were on the archive tier, not missing.",
+                    line_of("#### F-027 addendum"),
+                ),
+                entry(
+                    "Addendum (2)",
+                    "CUIMC2 demux pileup bottleneck is the BAM READ COUNT …",
+                    "Pileup time tracks reads per BAM, not donor count.",
+                    line_of("### F-027 addendum (2)"),
+                ),
+                entry(
+                    "Addendum (3)",
+                    "late",
+                    "Filed under F-028 by mistake.",
+                    line_of("### F-027 addendum (3)"),
+                ),
+            ]
+        );
+        // The finding's own status stands over an addendum's; the addenda's
+        // tags, evidence and questions are the finding's.
+        assert_eq!(f27.status, "supported");
+        assert_eq!(f27.tags, ["f-027", "data-completeness", "genotyping"]);
+        let rows: Vec<(&str, &str)> = f27
+            .ledger
+            .iter()
+            .map(|r| (r.date.as_str(), r.direction.as_str()))
+            .collect();
+        assert_eq!(
+            rows,
+            [("2026-07-15", "supports"), ("2026-07-20", "refines")]
+        );
+        assert_eq!(f27.updated, "2026-07-20");
+        assert_eq!(
+            f27.questions,
+            ["Would downsampling BAMs keep demux accuracy?"]
+        );
+
+        // A `####` addendum ends at the finding's next `###` section, which
+        // stays the finding's own.
+        let f28 = &findings[1];
+        assert_eq!(f28.status, "preliminary");
+        assert_eq!(f28.implications, "");
+        assert_eq!(
+            listed(f28),
+            [entry(
+                "Addendum",
+                "one swap found in batch 3",
+                "A single swap, fixed at the source.",
+                line_of("#### F-028"),
+            )]
+        );
+        assert_eq!(f28.ledger.len(), 1);
+        assert_eq!(f28.ledger[0].result, "one swap in 96");
+
+        // A reused id: two findings, never merged; the addendum extends the
+        // later one.
+        let (a, b) = (&findings[2], &findings[3]);
+        assert_eq!(
+            (a.claim.as_str(), a.status.as_str(), a.addenda.len()),
+            ("Ambient RNA is lane-specific", "robust", 0)
+        );
+        assert_eq!(
+            (b.claim.as_str(), b.status.as_str()),
+            ("Ambient RNA correction changes marker calls", "preliminary")
+        );
+        assert_eq!(
+            listed(b),
+            [entry(
+                "Addendum",
+                "holds with SoupX too",
+                "Checked with SoupX 1.6.",
+                line_of("### F-038 addendum"),
+            )]
+        );
+
+        // Addenda with no finding here: the first stands in for it (its
+        // heading the claim), all are listed; with no stated status of its
+        // own, the newest addendum's.
+        let f41 = &findings[4];
+        assert_eq!(
+            f41.claim,
+            "addendum: an addendum with no finding in this file"
+        );
+        assert_eq!(f41.line, line_of("## F-041"));
+        assert_eq!(f41.status, "robust");
+        assert_eq!(
+            listed(f41),
+            [
+                entry(
+                    "Addendum",
+                    "an addendum with no finding in this file",
+                    "A stray note.",
+                    line_of("## F-041"),
+                ),
+                entry(
+                    "Addendum (2)",
+                    "still stray",
+                    "Another.",
+                    line_of("### F-041 addendum (2)"),
+                ),
+            ]
+        );
+
+        // Claims that open with the word are findings.
+        assert_eq!(findings[5].claim, "Addendum-free protocols replicate");
+        let f51 = &findings[6];
+        assert_eq!(
+            (f51.claim.as_str(), f51.implications.as_str()),
+            (
+                "Addendum to protocol v2 improves yield",
+                "Switch the pilot to v2."
+            )
+        );
+
+        // An addendum written above its finding is still its own; its tag
+        // bullets are tags, not text.
+        let f60 = &findings[7];
+        assert_eq!(f60.claim, "Pilot libraries replicate");
+        assert_eq!(f60.line, line_of("## F-060"));
+        assert_eq!(f60.tags, ["early", "f-060"]);
+        assert_eq!(
+            listed(f60),
+            [entry(
+                "Addendum (early)",
+                "written above its finding",
+                "Seen first in the pilot.",
+                line_of("### F-060 addendum"),
+            )]
+        );
+
+        // On the wire, only a finding with addenda carries the key.
+        let wire = |f: &Finding| serde_json::to_value(f).unwrap();
+        assert_eq!(wire(f27)["addenda"][1]["label"], "Addendum");
+        assert!(wire(&findings[5]).get("addenda").is_none());
+
+        let rel = ".living/findings/data-completeness.md";
+        assert_eq!(
+            k.warnings,
+            [
+                format!(
+                    "{rel}: F-038 at line {} reuses the id of the finding at line {}; both are shown",
+                    line_of("## F-038: Ambient RNA correction"),
+                    line_of("## F-038: Ambient RNA is"),
+                ),
+                format!(
+                    "{rel}: the F-041 addendum at line {} has no F-041 finding in this file; shown on its own",
+                    line_of("## F-041"),
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn addendum_headings_and_their_bounds() {
+        let lead =
+            |rest: &str| addendum_heading(rest).map(|(label, title)| (label, title.to_owned()));
+        let some = |label: &str, title: &str| Some((label.to_owned(), title.to_owned()));
+        assert_eq!(lead("addendum: a — b"), some("Addendum", "a — b"));
+        assert_eq!(lead("Addendum (2): x"), some("Addendum (2)", "x"));
+        assert_eq!(lead("addendum (12:30) — x"), some("Addendum (12:30)", "x"));
+        assert_eq!(
+            lead("addendum 2026-07-20: x"),
+            some("Addendum 2026-07-20", "x")
+        );
+        assert_eq!(lead("addendum**: x"), some("Addendum", "x"));
+        assert_eq!(lead("ADDENDA"), some("ADDENDA", ""));
+        assert_eq!(lead("addendum - x"), some("Addendum", "x"));
+        assert_eq!(lead("addendum 2 - x"), some("Addendum 2", "x"));
+        assert_eq!(lead("addendum (late)"), some("Addendum (late)", ""));
+        for claim in [
+            "addendum on reads",
+            "Addendum to protocol v2 improves yield",
+            "addendum (unclosed: x",
+            "Addendum-free protocols",
+            "Addendums pile up",
+            "addendumx",
+            "An addendum",
+        ] {
+            assert_eq!(lead(claim), None, "{claim}");
+        }
+
+        // Many long addenda: the newest are kept, each text capped.
+        let long = "word ".repeat(1000);
+        let file: String = std::iter::once("## F-001: claim\n**Status:** supported\n".to_owned())
+            .chain(
+                (0..MAX_ADDENDA + 10).map(|n| format!("### F-001 addendum ({n}): note\n{long}\n")),
+            )
+            .collect();
+        let fx = Fixture::new("addenda-cap");
+        fx.write(".living/findings/t.md", &file);
+        let k = read(fx.root());
+        assert_eq!(k.topics[0].findings.len(), 1);
+        let f = &k.topics[0].findings[0];
+        assert_eq!(f.addenda.len(), MAX_ADDENDA);
+        assert_eq!(f.addenda[0].label, "Addendum (10)");
+        assert!(f
+            .addenda
+            .iter()
+            .all(|a| a.text.len() <= MAX_TEXT_BYTES && a.text.ends_with('…')));
+        assert_eq!(
+            k.warnings,
+            [format!(
+                "F-001: showing the newest {MAX_ADDENDA} of {} addenda",
+                MAX_ADDENDA + 10
+            )]
+        );
     }
 }
