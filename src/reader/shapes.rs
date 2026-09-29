@@ -718,6 +718,7 @@ fn closed_is_a_closed_word_leading_the_status() {
     ] {
         assert!(!is_closed(open), "{open}");
     }
+    assert!(is_closed("✅ done") && is_closed("✓ complete") && is_closed("✔"));
     assert!(heading_says_closed("#50 — x — ✅ DONE 2026-08-03"));
     assert!(heading_says_closed("#60 — atlas labels — COMPLETE"));
     assert!(!heading_says_closed("#52 — x — HALF DONE 2026-08-03"));
@@ -1274,8 +1275,8 @@ fn over_budget_the_cheapest_loss_comes_first() {
     let fx = Fixture::copy_of("fit", "reference");
     let full = read(fx.root());
     let size = |k: &Knowledge| serde_json::to_vec(k).unwrap().len();
-    // Shortening alone doesn't fit this budget; dropping cites and a few
-    // of the oldest entries does.
+    // Shortening alone doesn't fit this budget; dropping cites and some of
+    // the oldest entries does.
     let mut k = full.clone();
     let mut notes = Notes::default();
     let budget = size(&full) - 4000;
@@ -1283,25 +1284,16 @@ fn over_budget_the_cheapest_loss_comes_first() {
     assert!(size(&k) <= budget);
     let warnings = notes.finish();
     assert_eq!(warnings.len(), 3, "{warnings:?}");
+    assert!(warnings[2].starts_with("…and only the newest are shown"));
     assert!(k
         .topics
         .iter()
         .flat_map(|t| &t.findings)
         .all(|f| f.cites.is_empty()));
-    // Nothing else about the findings changed (their fields are short).
-    let without_cites = |topics: &[Topic]| {
-        let mut topics = topics.to_vec();
-        topics
-            .iter_mut()
-            .flat_map(|t| t.findings.iter_mut())
-            .for_each(|f| f.cites.clear());
-        serde_json::to_value(topics).unwrap()
-    };
-    assert_eq!(without_cites(&k.topics), without_cites(&full.topics));
-    // The oldest go, the newest stay.
-    assert_eq!(k.decisions[0].id, "D-157");
-    assert!(k.decisions.len() + k.learnings.len() < full.decisions.len() + full.learnings.len());
+    let findings: usize = k.topics.iter().map(|t| t.findings.len()).sum();
+    assert_eq!(k.counts.findings as usize, findings);
     assert_eq!(k.counts.decisions as usize, k.decisions.len());
+    assert_eq!(k.counts.learnings as usize, k.learnings.len());
 
     // Under budget, nothing changes.
     let mut same = full.clone();
@@ -1309,6 +1301,35 @@ fn over_budget_the_cheapest_loss_comes_first() {
     fit(&mut same, size(&full), &mut notes);
     assert_eq!(size(&same), size(&full));
     assert!(notes.finish().is_empty());
+}
+
+/// When findings are the bulk, findings give way — not the decisions and
+/// learnings beside them — and the budget holds whatever it takes.
+#[test]
+fn the_largest_section_gives_way_and_the_budget_always_holds() {
+    let fx = Fixture::new("findings-heavy");
+    let question = "why ".repeat(425);
+    let findings: String = (1..=40)
+        .map(|n| {
+            let questions: String = (0..20).map(|q| format!("- {q} {question}\n")).collect();
+            format!(
+                "## F-{n}: Claim {n}\n**Status:** supported\n\n### Open Questions\n{questions}\n"
+            )
+        })
+        .collect();
+    fx.write(".living/findings/t.md", &findings).write(
+        ".living/decisions.md",
+        "### [2026-01-01] D-1: One\n**Decision**: a\n\n### [2026-01-02] D-2: Two\n**Decision**: b\n",
+    );
+    let full = read(fx.root());
+    let size = |k: &Knowledge| serde_json::to_vec(k).unwrap().len();
+    for budget in [size(&full) / 2, 60_000, 20_000] {
+        let mut k = full.clone();
+        let mut notes = Notes::default();
+        fit(&mut k, budget, &mut notes);
+        assert!(size(&k) <= budget, "{budget}: {}", size(&k));
+        assert_eq!(k.decisions.len(), 2, "{budget}");
+    }
 }
 
 #[test]
@@ -1327,6 +1348,15 @@ fn a_dashless_id_needs_a_separator() {
     );
     assert_eq!(explicit_id("D-38", b'D'), Some(("D-38".to_owned(), "")));
     assert_eq!(explicit_id("L2 cache misses slow stage 04", b'L'), None);
+    assert_eq!(
+        explicit_id("L1-norm penalty hides sparse features", b'L'),
+        None
+    );
+    assert_eq!(explicit_id("L2.5 cutoff", b'L'), None);
+    assert_eq!(
+        explicit_id("D1. Pin it", b'D'),
+        Some(("D-1".to_owned(), "Pin it"))
+    );
     assert_eq!(explicit_id("L12345: too long", b'L'), None);
     assert_eq!(explicit_id("Decision 4", b'D'), None);
 }
@@ -1384,4 +1414,124 @@ fn hostile_text_never_panics() {
         assert!(json.len() <= SNAPSHOT_BUDGET);
         assert!(k.warnings.len() <= MAX_WARNINGS + 1);
     }
+}
+
+#[test]
+fn long_registries_keep_only_what_is_shown() {
+    let fx = Fixture::new("long-registries");
+    let rows: String = (1..=5000)
+        .map(|n| format!("| Item {n} | low | open | x | 2026-01-01 | a | — |\n"))
+        .collect();
+    let sessions: String = (1..=1000)
+        .map(|n| {
+            format!(
+                "| 2026-01-{:02} | s-{n:04} | p | main | 1m | 1 | Did {n}. | | complete | | |\n",
+                n % 28 + 1
+            )
+        })
+        .collect();
+    fx.write("MYCELIUM.md", "")
+        .write(
+            "todo/TODO_REGISTRY.md",
+            &format!(
+                "| Item | Priority | Status | Category | Date | Author | File |\n|---|---|---|---|---|---|---|\n{rows}\n## #1 — A section\nText.\n"
+            ),
+        )
+        .write(
+            ".living/log/LOG_REGISTRY.md",
+            &format!(
+                "| Date | Session ID | Project | Branch | Duration | Files Changed | Summary | Key Outputs | Status | Tags | Log |\n|---|---|---|---|---|---|---|---|---|---|---|\n{sessions}"
+            ),
+        );
+    let k = read(fx.root());
+    assert_eq!(k.todos.len(), MAX_ENTRIES);
+    assert_eq!(k.todos[MAX_ENTRIES - 1].title, "Item 1000");
+    assert_eq!(k.sessions.len(), MAX_SESSIONS);
+    // The newest: the last rows written, dated newest first.
+    assert!(k.sessions.iter().all(|s| s.id.as_str() > "s-0600"));
+    assert!(k
+        .warnings
+        .contains(&"todo/TODO_REGISTRY.md: showing the first 1000 of 5001 todos".to_owned()));
+    assert!(k.warnings.contains(
+        &".living/log/LOG_REGISTRY.md: showing the newest 400 of 1000 sessions".to_owned()
+    ));
+}
+
+#[test]
+fn positional_ids_count_the_lines_mycelium_counts() {
+    // mycelium's collect_entries numbers every column-1 `### ` line, even
+    // one inside a fence: so do positional ids.
+    let fx = Fixture::new("positional-fenced");
+    fx.write(
+        ".living/learnings.md",
+        "# Learnings\n\n```markdown\n### [YYYY-MM-DD] Title\n```\n\n\
+         ### [2026-01-02] First\n**What happened**: a\n\n### [2026-01-03] Second\n",
+    );
+    let k = read(fx.root());
+    let ids: Vec<(&str, &str)> = k
+        .learnings
+        .iter()
+        .map(|l| (l.id.as_str(), l.title.as_str()))
+        .collect();
+    assert_eq!(ids, [("L-3", "Second"), ("L-2", "First")]);
+}
+
+#[test]
+fn stated_quotes_the_status_that_status_came_from() {
+    let (_, f) = one_finding(
+        "stated-source",
+        "## F-1: A claim\n**Status:** established by rerun\n\n\
+         ### F-1 addendum: later\n**Status:** supported\n",
+    );
+    assert_eq!(
+        (f.status.as_str(), f.stated.as_str()),
+        ("supported", "supported")
+    );
+    let (_, f) = one_finding(
+        "stated-own",
+        "## F-1: A claim\n**Status:** preliminary (one run)\n\n\
+         ### F-1 addendum: later\n**Status:** robust\n",
+    );
+    assert_eq!(
+        (f.status.as_str(), f.stated.as_str()),
+        ("preliminary", "preliminary (one run)")
+    );
+}
+
+#[test]
+fn a_span_ends_at_its_last_line_of_content() {
+    let fx = Fixture::new("span-end");
+    fx.write(
+        ".living/decisions.md",
+        "### [2026-01-01] A\n**Decision**: a\n\n---\n\n<!-- Add new entries above this line -->\n\n### [2026-01-02] B\n**Decision**: b\n",
+    );
+    let k = read(fx.root());
+    let a = k.decisions.iter().find(|d| d.title == "A").unwrap();
+    assert_eq!(a.span.as_ref().map(|s| (s.line, s.end_line)), Some((1, 2)));
+}
+
+/// One 2 MB line of `·`-joined bold fields, or of markers, reads in
+/// bounded time.
+#[test]
+fn a_huge_line_of_fields_or_markers_stays_linear() {
+    let fx = Fixture::new("huge-line");
+    let fields = format!(
+        "### D-1 t\n**Tags**: a {}\n",
+        "· **status: x** ".repeat(60_000)
+    );
+    let markers = format!("### D-2 see D-3 {}\n", "RETRACTED ".repeat(80_000));
+    fx.write(".living/decisions.md", &format!("{fields}\n{markers}"))
+        .write(
+            ".living/findings/t.md",
+            &format!(
+                "## F-1: x\n> ⚠️ {}\n",
+                "SUSPECT superseded ".repeat(100_000)
+            ),
+        );
+    let started = std::time::Instant::now();
+    let k = read(fx.root());
+    assert!(started.elapsed().as_secs() < 30, "{:?}", started.elapsed());
+    // Both files were read (each under the per-file cap).
+    assert_eq!(k.decisions.len(), 2, "{:?}", k.warnings);
+    assert_eq!(k.counts.findings, 1);
 }

@@ -721,10 +721,12 @@ pub(crate) fn read(fs: &impl Fs, plan: Plan) -> Knowledge {
     knowledge
 }
 
-/// Keeps the serialized snapshot under `budget`, cheapest loss first: the
-/// long text fields shortened (the files hold them in full, and the view
-/// reads bodies from `span`), then every entry's `cites`, then the oldest
-/// learnings and decisions. Each step says so in `warnings`.
+/// Keeps the serialized snapshot under `budget`, cheapest loss first: every
+/// long text field shortened (the files hold them in full, and the view
+/// reads bodies from `span`), then every entry's `cites`, then — a tenth at
+/// a time, from whichever section is largest — the oldest entries. Each
+/// step says so in `warnings`. It always ends under budget: the last resort
+/// empties the lists.
 fn fit(k: &mut Knowledge, budget: usize, notes: &mut Notes) {
     let size =
         |k: &Knowledge| chimaera_plugin_api::serde_json::to_vec(k).map_or(usize::MAX, |v| v.len());
@@ -732,34 +734,7 @@ fn fit(k: &mut Knowledge, budget: usize, notes: &mut Notes) {
     if over <= budget {
         return;
     }
-    let short = |s: &mut String| {
-        if s.len() > SHORT_TEXT_BYTES {
-            *s = cap_bytes(std::mem::take(s), SHORT_TEXT_BYTES);
-        }
-    };
-    for f in k.topics.iter_mut().flat_map(|t| t.findings.iter_mut()) {
-        short(&mut f.implications);
-        short(&mut f.statement);
-        f.addenda.iter_mut().for_each(|a| short(&mut a.text));
-        f.ledger.iter_mut().for_each(|r| short(&mut r.result));
-    }
-    for d in &mut k.decisions {
-        for s in [
-            &mut d.context,
-            &mut d.decision,
-            &mut d.rationale,
-            &mut d.consequences,
-        ] {
-            short(s);
-        }
-        d.alternatives.iter_mut().for_each(short);
-    }
-    for l in &mut k.learnings {
-        for s in [&mut l.what, &mut l.why, &mut l.resolution] {
-            short(s);
-        }
-    }
-    k.todos.iter_mut().for_each(|t| short(&mut t.item));
+    shorten(k);
     let mib = |n: usize| format!("{:.1} MiB", n as f64 / (1024.0 * 1024.0));
     notes.push(format!(
         "the snapshot was {}, over its {} budget: long text fields are shortened to {SHORT_TEXT_BYTES} bytes (the files hold them in full)",
@@ -777,29 +752,159 @@ fn fit(k: &mut Knowledge, budget: usize, notes: &mut Notes) {
     k.todos.iter_mut().for_each(|t| t.cites.clear());
     k.conventions.iter_mut().for_each(|c| c.cites.clear());
     notes.push("…and the files, scripts and jobs entries cite are left out".to_owned());
-    // Newest first, so the oldest go: a tenth of the longer list at a time.
-    let (learnings, decisions) = (k.learnings.len(), k.decisions.len());
-    while size(k) > budget && !(k.learnings.is_empty() && k.decisions.is_empty()) {
-        let list = if k.learnings.len() >= k.decisions.len() {
-            k.learnings.len()
-        } else {
-            k.decisions.len()
-        };
-        let cut = (list / 10).max(1);
-        if k.learnings.len() >= k.decisions.len() {
-            k.learnings.truncate(list - cut);
-        } else {
-            k.decisions.truncate(list - cut);
+
+    // Then the oldest entries of the largest section, a tenth at a time.
+    let before = (
+        k.topics.iter().map(|t| t.findings.len()).sum::<usize>(),
+        k.decisions.len(),
+        k.learnings.len(),
+        k.todos.len(),
+        k.sessions.len(),
+    );
+    while size(k) > budget {
+        let sizes = [
+            section_size(&k.topics),
+            section_size(&k.decisions),
+            section_size(&k.learnings),
+            section_size(&k.todos),
+            section_size(&k.sessions),
+            section_size(&k.questions),
+            section_size(&k.conventions),
+        ];
+        let (largest, &bytes) = sizes
+            .iter()
+            .enumerate()
+            .max_by_key(|&(_, &bytes)| bytes)
+            .expect("seven sections");
+        if bytes <= 2 {
+            break;
+        }
+        let tenth = |n: usize| (n / 10).max(1);
+        match largest {
+            // Findings: the lowest ids of the largest topic (the oldest).
+            0 => {
+                if let Some(topic) = k.topics.iter_mut().max_by_key(|t| t.findings.len()) {
+                    let cut = tenth(topic.findings.len()).min(topic.findings.len());
+                    topic.findings.drain(..cut);
+                }
+                k.topics.retain(|t| !t.findings.is_empty());
+            }
+            // Newest first: the oldest are last.
+            1 => k
+                .decisions
+                .truncate(k.decisions.len() - tenth(k.decisions.len())),
+            2 => k
+                .learnings
+                .truncate(k.learnings.len() - tenth(k.learnings.len())),
+            3 => k.todos.truncate(k.todos.len() - tenth(k.todos.len())),
+            4 => k
+                .sessions
+                .truncate(k.sessions.len() - tenth(k.sessions.len())),
+            5 => k
+                .questions
+                .truncate(k.questions.len() - tenth(k.questions.len())),
+            _ => k
+                .conventions
+                .truncate(k.conventions.len() - tenth(k.conventions.len())),
         }
     }
-    if k.learnings.len() < learnings || k.decisions.len() < decisions {
+    let after = (
+        k.topics.iter().map(|t| t.findings.len()).sum::<usize>(),
+        k.decisions.len(),
+        k.learnings.len(),
+        k.todos.len(),
+        k.sessions.len(),
+    );
+    if after != before {
         notes.push(format!(
-            "…and only the newest {} of {learnings} learnings and {} of {decisions} decisions are shown",
-            k.learnings.len(),
-            k.decisions.len()
+            "…and only the newest are shown: {} of {} findings, {} of {} decisions, {} of {} learnings, {} of {} to-dos, {} of {} sessions",
+            after.0, before.0, after.1, before.1, after.2, before.2, after.3, before.3, after.4, before.4
         ));
-        k.counts.learnings = count(k.learnings.len());
-        k.counts.decisions = count(k.decisions.len());
+        let open_todos = k.todos.iter().filter(|t| !t.closed).count();
+        k.counts.findings = count(after.0);
+        k.counts.decisions = count(after.1);
+        k.counts.learnings = count(after.2);
+        k.counts.todos = count(open_todos);
+        k.counts.open = count(open_todos + k.questions.len());
+        k.counts.questions = count(k.questions.len());
+        k.counts.conventions = count(k.conventions.len());
+        k.counts.sessions = count(k.sessions.len());
+    }
+}
+
+/// A list's serialized size.
+fn section_size<T: Serialize>(list: &[T]) -> usize {
+    chimaera_plugin_api::serde_json::to_vec(list).map_or(0, |v| v.len())
+}
+
+/// Every long text field cut to [`SHORT_TEXT_BYTES`], and every list a
+/// finding repeats (evidence, questions) to its newest few.
+fn shorten(k: &mut Knowledge) {
+    const KEEP: usize = 5;
+    let short = |s: &mut String| {
+        if s.len() > SHORT_TEXT_BYTES {
+            *s = cap_bytes(std::mem::take(s), SHORT_TEXT_BYTES);
+        }
+    };
+    for f in k.topics.iter_mut().flat_map(|t| t.findings.iter_mut()) {
+        for s in [
+            &mut f.claim,
+            &mut f.implications,
+            &mut f.statement,
+            &mut f.stated,
+        ] {
+            short(s);
+        }
+        f.questions.truncate(KEEP);
+        f.questions.iter_mut().for_each(short);
+        let rows = f.ledger.len();
+        f.ledger.drain(..rows.saturating_sub(KEEP));
+        for r in &mut f.ledger {
+            for s in [&mut r.run, &mut r.dataset, &mut r.project, &mut r.result] {
+                short(s);
+            }
+        }
+        for a in &mut f.addenda {
+            for s in [&mut a.label, &mut a.title, &mut a.text, &mut a.stated] {
+                short(s);
+            }
+        }
+    }
+    k.questions.iter_mut().for_each(|q| short(&mut q.text));
+    for d in &mut k.decisions {
+        for s in [
+            &mut d.title,
+            &mut d.context,
+            &mut d.decision,
+            &mut d.rationale,
+            &mut d.consequences,
+            &mut d.stated,
+        ] {
+            short(s);
+        }
+        d.alternatives.truncate(KEEP);
+        d.alternatives.iter_mut().for_each(short);
+    }
+    for l in &mut k.learnings {
+        for s in [&mut l.title, &mut l.what, &mut l.why, &mut l.resolution] {
+            short(s);
+        }
+    }
+    for t in &mut k.todos {
+        for s in [&mut t.item, &mut t.status, &mut t.category, &mut t.author] {
+            short(s);
+        }
+    }
+    for s in &mut k.sessions {
+        for f in [&mut s.summary, &mut s.outputs, &mut s.files] {
+            short(f);
+        }
+    }
+    for c in &mut k.conventions {
+        short(&mut c.title);
+    }
+    for w in &mut k.warnings {
+        short(w);
     }
 }
 
@@ -1747,6 +1852,11 @@ fn is_closed(status: &str) -> bool {
         "canceled",
         "dropped",
     ];
+    // `✅ done`, `✓ complete`: a check mark leading the status is the word.
+    let status = status.trim_start();
+    if status.starts_with(['✅', '✓', '✔', '☑']) {
+        return true;
+    }
     let norm: String = status
         .to_lowercase()
         .chars()
@@ -1978,7 +2088,17 @@ fn cell_text(cell: &str) -> String {
 /// lines excluded.
 fn span_of(doc: &Doc, rel: &str, start: usize, end: usize) -> Span {
     let mut last = end.min(doc.lines.len()).max(start + 1);
-    while last > start + 1 && doc.lines[last - 1].trim().is_empty() {
+    // Trailing blank lines, a `---` between entries and a trailing comment
+    // (`<!-- Add new entries above this line -->`) are not the entry's.
+    while last > start + 1 {
+        let line = doc.lines[last - 1];
+        let trailing = line.trim().is_empty()
+            || (doc.marks[last - 1] == Mark::Text && is_thematic_break(line))
+            || doc.marks[last - 1] == Mark::Comment
+            || (line.trim_start().starts_with("<!--") && line.trim_end().ends_with("-->"));
+        if !trailing {
+            break;
+        }
         last -= 1;
     }
     Span {
@@ -2215,13 +2335,23 @@ fn split_inline<'l>(
 }
 
 fn split_inline_str<'s>(label: String, v: &'s str, known: &[&str]) -> Vec<(String, Cow<'s, str>)> {
-    let cuts: Vec<usize> = v
+    // Each `·` is checked against its own segment only (up to the next
+    // one), so a long line stays linear; a line of more is prose.
+    const MAX_DOTS: usize = 64;
+    let dots: Vec<usize> = v
         .match_indices('·')
         .map(|(at, _)| at)
-        .filter(|&at| {
-            let next = v[at + '·'.len_utf8()..].trim_start();
+        .take(MAX_DOTS)
+        .collect();
+    let cuts: Vec<usize> = dots
+        .iter()
+        .enumerate()
+        .filter(|&(k, &at)| {
+            let end = dots.get(k + 1).copied().unwrap_or(v.len());
+            let next = v[at + '·'.len_utf8()..end].trim_start();
             next.starts_with("**") && field_line(next, known).is_some()
         })
+        .map(|(_, &at)| at)
         .collect();
     let mut out = Vec::with_capacity(cuts.len() + 1);
     let first_end = cuts.first().copied().unwrap_or(v.len());
@@ -2456,9 +2586,14 @@ fn explicit_id(text: &str, letter: u8) -> Option<(String, &str)> {
                 c.is_whitespace() || matches!(c, ':' | '.' | '-' | '–' | '—' | ')' | '*' | ',')
             })
         } else {
-            rest.trim_start()
-                .starts_with([':', '.', '-', '–', '—', '*'])
-                || rest.trim().is_empty()
+            // `D1: title`, `D1. title`, `D1 — title`, `**D1**: title` — but
+            // not `L1-norm`, `L2.5 cutoff`, `L2 cache`.
+            let r = rest.trim_start_matches('*');
+            r.starts_with(':')
+                || (r.starts_with('.') && !r[1..].starts_with(|c: char| c.is_ascii_digit()))
+                || (rest.starts_with(char::is_whitespace)
+                    && rest.trim_start().starts_with([':', '-', '–', '—']))
+                || r.trim().is_empty()
         };
     if !separated {
         return None;
@@ -2563,8 +2698,15 @@ fn entry_spans<'a>(doc: &Doc<'a>, letter: u8) -> Spans<'a> {
         mislevelled: 0,
     };
     let mut open: Option<EntrySpan> = None;
+    // mycelium's `collect_entries` numbers every column-1 `### ` line, fenced
+    // or not: positional ids count the same lines, so `L-40` here is the
+    // `L-40` its tools print.
     let mut ordinal = 0usize;
     for i in 0..doc.lines.len() {
+        let raw_entry = doc.lines[i].starts_with("### ");
+        if raw_entry {
+            ordinal += 1;
+        }
         let Some((level, text)) = doc.text(i).and_then(heading) else {
             continue;
         };
@@ -2584,15 +2726,12 @@ fn entry_spans<'a>(doc: &Doc<'a>, letter: u8) -> Spans<'a> {
             spans.push(span);
         }
         if entry {
-            if level == 3 {
-                ordinal += 1;
-            }
             open = Some(EntrySpan {
                 start: i,
                 end: 0,
                 text,
                 level,
-                ordinal: if level == 3 { ordinal } else { 0 },
+                ordinal: if level == 3 && raw_entry { ordinal } else { 0 },
             });
         }
     }
@@ -2681,7 +2820,7 @@ fn log_entries<'a>(
     // mycelium numbers `###` entries by position; that id means something
     // only where no entry carries its own.
     if entries.iter().all(|e| e.id.is_empty()) {
-        for e in entries.iter_mut().filter(|e| e.span.level == 3) {
+        for e in entries.iter_mut().filter(|e| e.span.ordinal > 0) {
             e.id = format!("{}-{}", letter as char, e.span.ordinal);
         }
     }
@@ -3204,7 +3343,9 @@ fn parse_topic(
             if let Some(k) = open_finding.take() {
                 heads[k].reach = i;
             }
-            finding_levels.insert(id.clone(), level);
+            if heads.len() < MAX_SCANNED_ENTRIES {
+                finding_levels.insert(id.clone(), level);
+            }
         }
         if heads.len() < MAX_SCANNED_ENTRIES {
             if followup.is_none() {
@@ -3457,20 +3598,24 @@ fn parse_finding(
         .map_or_else(|| "unknown".to_owned(), normalize_status);
     let known_status = status != "unknown";
     let mut stated = fields.stated(&["status"]);
+    // Where `status` came from when a follow-up gave it: `stated` then
+    // quotes that same Status.
+    let mut status_from_followup = false;
     let mut tags = fields.tags();
     let mut listed = Vec::with_capacity(addenda.len().min(MAX_ADDENDA));
     let mut day = day_number(&date);
     for (n, addendum) in addenda.iter().enumerate() {
         let its = Fields::parse(doc, std::slice::from_ref(&addendum.body), FINDING_FIELDS);
+        let its_stated = its.stated(&["status"]);
         if let Some(said) = its
             .first(&["status"])
             .map(normalize_status)
             .filter(|s| !known_status && s != "unknown")
         {
             status = said;
-        }
-        let its_stated = its.stated(&["status"]);
-        if !states_own && !its_stated.is_empty() {
+            stated.clone_from(&its_stated);
+            status_from_followup = true;
+        } else if !states_own && !status_from_followup && !its_stated.is_empty() {
             stated.clone_from(&its_stated);
         }
         for tag in its.tags() {
@@ -4052,10 +4197,19 @@ fn parse_todos(text: &str, rel: &str, legacy: bool, notes: &mut Notes) -> (Vec<T
         None,
     }
     let mut block = Block::Registry;
+    // Every registry row's line (where an appended row ends a section),
+    // but the cells of only the rows that can be shown.
+    let mut row_lines: Vec<usize> = Vec::new();
     let mut rows: Vec<(usize, Vec<String>)> = Vec::new();
     let mut sections: Vec<usize> = Vec::new();
     // Every `#`/`##` heading after the header: where a section ends.
     let mut bounds: Vec<usize> = Vec::new();
+    let mut keep_row = |i: usize, cells: Vec<String>| {
+        row_lines.push(i);
+        if rows.len() < MAX_ENTRIES {
+            rows.push((i, cells));
+        }
+    };
     for i in header_at + 2..doc.lines.len() {
         let Some(line) = doc.text(i) else {
             continue;
@@ -4090,11 +4244,11 @@ fn parse_todos(text: &str, rel: &str, legacy: bool, notes: &mut Notes) -> (Vec<T
             continue;
         }
         match block {
-            Block::Registry => rows.push((i, cells)),
+            Block::Registry => keep_row(i, cells),
             Block::Foreign => {}
             Block::Loose | Block::None => {
                 if cells.len() == width {
-                    rows.push((i, cells));
+                    keep_row(i, cells);
                     block = Block::Loose;
                 } else {
                     block = Block::Foreign;
@@ -4104,11 +4258,8 @@ fn parse_todos(text: &str, rel: &str, legacy: bool, notes: &mut Notes) -> (Vec<T
     }
 
     let mut todos = Vec::new();
-    let total = rows.len() + sections.len();
+    let total = row_lines.len() + sections.len();
     for (n, (i, cells)) in rows.iter().enumerate() {
-        if todos.len() == MAX_ENTRIES {
-            break;
-        }
         todos.extend(todo_row(
             cells,
             &cols,
@@ -4122,10 +4273,9 @@ fn parse_todos(text: &str, rel: &str, legacy: bool, notes: &mut Notes) -> (Vec<T
             break;
         }
         // A section ends at the next heading, or at a registry row appended
-        // after it.
-        let next_bound = bounds.iter().copied().find(|&b| b > start);
-        let next_row = rows.iter().map(|(i, _)| *i).find(|&i| i > start);
-        let end = [next_bound, next_row]
+        // after it (both lists are in line order).
+        let next = |lines: &[usize]| lines.get(lines.partition_point(|&l| l <= start)).copied();
+        let end = [next(&bounds), next(&row_lines)]
             .into_iter()
             .flatten()
             .min()
@@ -4502,7 +4652,10 @@ fn parse_sessions(text: &str, rel: &str, notes: &mut Notes) -> Vec<Session> {
     }) else {
         return Vec::new();
     };
-    let mut rows: Vec<(usize, Session)> = Vec::new();
+    // The registry appends, so the last rows are the newest: only those
+    // are kept while reading.
+    let mut rows: VecDeque<(usize, Session)> = VecDeque::new();
+    let mut total = 0usize;
     for i in header_at + 2..doc.lines.len() {
         let Some(cells) = row_at(i) else {
             continue;
@@ -4523,7 +4676,11 @@ fn parse_sessions(text: &str, rel: &str, notes: &mut Notes) -> Vec<Session> {
             .and_then(|i| cells.get(i))
             .and_then(|c| strip_links(c).1)
             .map_or_else(String::new, |target| relative_path(".living/log", &target));
-        rows.push((
+        total += 1;
+        if rows.len() == MAX_SESSIONS {
+            rows.pop_front();
+        }
+        rows.push_back((
             i,
             Session {
                 id,
@@ -4538,14 +4695,13 @@ fn parse_sessions(text: &str, rel: &str, notes: &mut Notes) -> Vec<Session> {
             },
         ));
     }
-    rows.sort_by(|a, b| b.1.date.cmp(&a.1.date).then(b.0.cmp(&a.0)));
-    if rows.len() > MAX_SESSIONS {
+    if total > rows.len() {
         notes.push(format!(
-            "{rel}: showing the newest {MAX_SESSIONS} of {} sessions",
-            rows.len()
+            "{rel}: showing the newest {MAX_SESSIONS} of {total} sessions"
         ));
-        rows.truncate(MAX_SESSIONS);
     }
+    let mut rows: Vec<(usize, Session)> = rows.into();
+    rows.sort_by(|a, b| b.1.date.cmp(&a.1.date).then(b.0.cmp(&a.0)));
     rows.into_iter().map(|(_, s)| s).collect()
 }
 

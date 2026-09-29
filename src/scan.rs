@@ -522,8 +522,30 @@ pub(crate) fn scan_cites(line: &str, cites: &mut Vec<Cite>) {
 /// Words before `SUPERSEDED` that make it partial or negated: "⛔ SCOPE
 /// CLAUSE SUPERSEDED BY D-116" says a clause went, not the entry.
 const PARTIAL: &[&str] = &[
-    "clause", "part", "section", "half", "premise", "not", "never",
+    "clause", "part", "section", "half", "premise", "not", "never", "longer",
 ];
+
+/// Words before a marker that negate it: "no longer SUSPECT", "not
+/// RETRACTED".
+const NEGATING: &[&str] = &["not", "no", "never", "longer"];
+
+/// Markers are read from a line's first bytes, at most a few times each: a
+/// heading or a Status is short, and one pathological line must stay
+/// linear.
+const MARKER_SCAN_BYTES: usize = 4096;
+const MARKER_MATCHES: usize = 8;
+
+/// `line` cut to [`MARKER_SCAN_BYTES`] on a char boundary.
+fn marker_head(line: &str) -> &str {
+    if line.len() <= MARKER_SCAN_BYTES {
+        return line;
+    }
+    let mut end = MARKER_SCAN_BYTES;
+    while !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    &line[..end]
+}
 
 /// The word before byte `at`, lowercased ("" when none).
 fn word_before(s: &str, at: usize) -> String {
@@ -579,7 +601,7 @@ fn about_another(line: &str, at: usize, own: &str) -> bool {
 /// in a sentence about this entry.
 fn superseded_in(line: &str, own: &str) -> Option<State> {
     let lower = line.to_ascii_lowercase();
-    for (at, _) in lower.match_indices("superseded") {
+    for (at, _) in lower.match_indices("superseded").take(MARKER_MATCHES) {
         if !starts_word(&lower, at) || PARTIAL.contains(&word_before(line, at).as_str()) {
             continue;
         }
@@ -591,8 +613,8 @@ fn superseded_in(line: &str, own: &str) -> Option<State> {
         let says_by = by.is_some()
             || line[after..]
                 .trim_start_matches(|c: char| c.is_whitespace() || c == '*')
-                .to_ascii_lowercase()
-                .starts_with("by ");
+                .get(..3)
+                .is_some_and(|w| w.eq_ignore_ascii_case("by "));
         if stop_sign || (says_by && !about_another(line, at, own)) {
             return Some(State {
                 kind: "superseded",
@@ -603,13 +625,14 @@ fn superseded_in(line: &str, own: &str) -> Option<State> {
     None
 }
 
-/// `SUSPECT` as a word: after `⚠️`, or in a sentence about this entry.
-fn suspect_in(line: &str, own: &str) -> bool {
-    find_word(line, "SUSPECT").any(|at| {
-        let warned = line[..at]
+/// `⚠️ SUSPECT` — the marker, not the word ("the earlier SUSPECT flag was
+/// cleared", "no longer SUSPECT").
+fn suspect_in(line: &str) -> bool {
+    find_word(line, "SUSPECT").take(MARKER_MATCHES).any(|at| {
+        line[..at]
             .rfind('⚠')
-            .is_some_and(|sign| !line[sign..at].contains(['.', ';']));
-        warned || !about_another(line, at, own)
+            .is_some_and(|sign| !line[sign..at].contains(['.', ';']))
+            && !NEGATING.contains(&word_before(line, at).as_str())
     })
 }
 
@@ -628,32 +651,43 @@ fn id_before(s: &str, at: usize) -> Option<&str> {
 /// Own `retracted` from `RETRACTED` in a heading or a Status — unless another
 /// entry's id stands right before it ("F-037 RETRACTED": that one is).
 fn retracted_in(line: &str, own: &str) -> Option<State> {
-    find_word(line, "RETRACTED").find_map(|at| {
-        let named = id_before(line, at);
-        let own_sentence = named.is_none_or(|id| id == own) && !about_another(line, at, own);
-        own_sentence.then(|| State {
-            kind: "retracted",
-            by: by_id(line, at + "RETRACTED".len()),
+    find_word(line, "RETRACTED")
+        .take(MARKER_MATCHES)
+        .find_map(|at| {
+            let named = id_before(line, at);
+            // "not RETRACTED", "was RETRACTED in error; reinstated".
+            let sentence = &line[at..];
+            let sentence = &sentence[..sentence.find(['.', ';']).unwrap_or(sentence.len())];
+            let lower = sentence.to_ascii_lowercase();
+            let undone = NEGATING.contains(&word_before(line, at).as_str())
+                || lower.contains("in error")
+                || lower.contains("reinstated");
+            let own_sentence =
+                named.is_none_or(|id| id == own) && !undone && !about_another(line, at, own);
+            own_sentence.then(|| State {
+                kind: "retracted",
+                by: by_id(line, at + "RETRACTED".len()),
+            })
         })
-    })
 }
 
 /// The state an entry's own text declares: `heading` and `status` may say
 /// RETRACTED; the heading and `first` lines may say SUPERSEDED or SUSPECT.
 /// Retracted outranks superseded, which outranks suspect.
 pub(crate) fn own_state(heading: &str, status: &str, first: &[&str], own: &str) -> Option<State> {
+    let (heading, status) = (marker_head(heading), marker_head(status));
     if let Some(state) = retracted_in(heading, own).or_else(|| retracted_in(status, own)) {
         return Some(state);
     }
     let lines = || {
         std::iter::once(heading)
             .chain(std::iter::once(status))
-            .chain(first.iter().copied())
+            .chain(first.iter().map(|l| marker_head(l)))
     };
     if let Some(state) = lines().find_map(|l| superseded_in(l, own)) {
         return Some(state);
     }
-    lines().any(|l| suspect_in(l, own)).then_some(State {
+    lines().any(suspect_in).then_some(State {
         kind: "suspect",
         by: None,
     })
@@ -730,7 +764,8 @@ pub(crate) fn scan_amends(line: &str, own: &str, amends: &mut Vec<Amend>) {
 /// `F-037 RETRACTED` in a heading or an entry's first lines: this entry
 /// retracts F-037.
 pub(crate) fn scan_retracted_ids(line: &str, own: &str, amends: &mut Vec<Amend>) {
-    for at in find_word(line, "RETRACTED") {
+    let line = marker_head(line);
+    for at in find_word(line, "RETRACTED").take(MARKER_MATCHES) {
         if let Some(id) = id_before(line, at).filter(|id| *id != own) {
             if !id.starts_with("T-") {
                 push_amend(amends, "retracts", id, own);
@@ -970,6 +1005,21 @@ mod tests {
             None
         );
         assert_eq!(state("x", "", &["F-185's labels are SUSPECT."]), None);
+        // Negated or undone markers are no state.
+        for (heading, status, first) in [
+            ("x", "supported — no longer SUSPECT after the rerun", ""),
+            ("x", "", "the earlier SUSPECT flag was cleared"),
+            ("x", "robust (was RETRACTED in error; reinstated)", ""),
+            ("F-041 — groups hold, not RETRACTED", "", ""),
+            ("x", "", "> ⚠️ no longer SUSPECT"),
+            ("x", "no longer superseded by D-12", ""),
+        ] {
+            assert_eq!(
+                state(heading, status, &[first]),
+                None,
+                "{heading} | {status} | {first}"
+            );
+        }
         assert_eq!(
             state(
                 "x",
@@ -1070,5 +1120,31 @@ mod tests {
         );
         assert_eq!(cap_chars("abcdef", 4), "abc…");
         assert_eq!(cap_chars("abc", 4), "abc");
+    }
+}
+
+#[cfg(test)]
+mod linear {
+    use super::*;
+
+    /// One pathological line — a heading, a Status or a first line of
+    /// 2 MB of markers — is read in bounded time.
+    #[test]
+    fn marker_scans_stay_linear_on_one_huge_line() {
+        let started = std::time::Instant::now();
+        for word in [
+            "RETRACTED ",
+            "SUSPECT ",
+            "superseded ",
+            "⚠️ SUSPECT ",
+            "F-12 RETRACTED ",
+        ] {
+            let line = format!("D-1 see D-2 {}", word.repeat(2_000_000 / word.len()));
+            let _ = own_state(&line, &line, &[&line, &line, &line], "D-1");
+            let mut amends = Vec::new();
+            scan_retracted_ids(&line, "D-1", &mut amends);
+            scan_amends(&line, "D-1", &mut amends);
+        }
+        assert!(started.elapsed().as_secs() < 20, "{:?}", started.elapsed());
     }
 }
