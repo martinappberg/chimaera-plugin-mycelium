@@ -804,10 +804,14 @@ fn the_newest_handoff_wins_and_numbered_headings_fill_the_slots() {
         "The shared handoff .mycelium/last-session.md is the Stop hook's fallback stub, while a newer hand-written handoff exists at .mycelium/run/claude/sess-a/last-session.md."
     );
 
-    // Newest wins even when it is the stub; the tidy row still says so.
+    // A newer stub (the Stop hook writes it at a session's end) does not
+    // hide the hand-written handoff; the tidy row still says so.
     fx.set_mtime_at(".mycelium/last-session.md", 1_790_630_000);
     let k = read(fx.root());
-    assert_eq!(k.left_off.unwrap().path, ".mycelium/last-session.md");
+    assert_eq!(
+        k.left_off.unwrap().path,
+        ".mycelium/run/claude/sess-a/last-session.md"
+    );
     assert!(k.tidy[0].text.ends_with(
         "while a hand-written handoff exists at .mycelium/run/claude/sess-a/last-session.md."
     ));
@@ -1093,11 +1097,15 @@ fn the_reference_tree_reads_every_shape() {
             ("handoff", "7c1f0a52-0000-4000-8000-00000000000a"),
             ("handoff", "7c1f0a52-0000-4000-8000-00000000000a"),
             ("decision", "D-157"),
-            ("finding", "F-190"),
-            ("finding", "F-190"),
-            ("finding", "F-190"),
         ]
     );
+    // F-190 put questions to the user, but F-192 retracts it: nothing it
+    // asked is waiting any more.
+    assert!(k
+        .topics
+        .iter()
+        .flat_map(|t| &t.findings)
+        .any(|f| f.id == "F-190" && f.state.as_ref().is_some_and(|s| s.kind == "retracted")));
     let tidy: Vec<&str> = k.tidy.iter().map(|t| t.kind).collect();
     assert_eq!(
         tidy,
@@ -1534,4 +1542,57 @@ fn a_huge_line_of_fields_or_markers_stays_linear() {
     // Both files were read (each under the per-file cap).
     assert_eq!(k.decisions.len(), 2, "{:?}", k.warnings);
     assert_eq!(k.counts.findings, 1);
+}
+
+/// An ask is dated by the part that wrote it: a follow-up added today does
+/// not bring back a question its finding asked months ago, and a settled
+/// finding's questions no longer wait.
+#[test]
+fn asks_are_dated_by_their_part_and_settled_entries_ask_nothing() {
+    let fx = Fixture::new("asks-parts");
+    fx.write(
+        ".living/findings/t.md",
+        "## F-010 — Old question (2026-06-01)\n\nPut to the user: whether to rerun stage 02.\n\n\
+         ### F-010 addendum (2026-09-27): rerun done\n\nThe rerun finished; put to the user: keep v2?\n\n\
+         ## F-020 — Settled question (2026-09-26)\n\nPut to the user: which cutoff?\n\n\
+         ### F-020 RESOLVED (2026-09-27)\n\nThe user chose 0.5.\n\n\
+         ## F-030 — Newest (2026-09-28)\n\nNothing to ask.\n",
+    );
+    let k = read(fx.root());
+    let asks: Vec<(&str, &str)> = k
+        .asks
+        .iter()
+        .map(|a| (a.source.id.as_str(), a.text.as_str()))
+        .collect();
+    assert_eq!(
+        asks,
+        [("F-010", "The rerun finished; put to the user: keep v2?")]
+    );
+}
+
+/// Over budget, closed to-dos go before open ones, and the oldest open ones
+/// before the newest; the counts follow.
+#[test]
+fn an_oversized_snapshot_drops_closed_then_oldest_todos() {
+    let mut k = Knowledge::default();
+    for n in 0..40 {
+        k.todos.push(Todo {
+            item: format!("to-do {n} {}", "x".repeat(200)),
+            title: format!("to-do {n}"),
+            closed: n % 4 == 0,
+            key: format!("todo/r{n}"),
+            source: "table",
+            ..Todo::default()
+        });
+    }
+    let full = chimaera_plugin_api::serde_json::to_vec(&k).unwrap().len();
+    let mut notes = Notes::default();
+    fit(&mut k, full * 7 / 10, &mut notes);
+    assert!(chimaera_plugin_api::serde_json::to_vec(&k).unwrap().len() <= full * 7 / 10);
+    // Every closed one went before any open one did.
+    let open_left = k.todos.iter().filter(|t| !t.closed).count();
+    assert!(k.todos.iter().all(|t| !t.closed) || open_left == 30);
+    // The newest open to-do survives.
+    assert!(k.todos.iter().any(|t| t.key == "todo/r39"));
+    assert_eq!(k.counts.todos as usize, open_left);
 }

@@ -10,7 +10,7 @@ From a Chimaera daemon: `chimaera plugin add martinappberg/chimaera-plugin-mycel
 
 ## What it reads
 
-Only what agents write, never computed: `.living/findings/*.md`, `decisions.md`, `learnings.md`, `conventions.md` and `generated-conventions/*/convention.md`, `.living/log/LOG_REGISTRY.md`, `todo/TODO_REGISTRY.md` (the table and the `##` to-do sections below it), and the newest handoff among `.mycelium/last-session.md` and every `.mycelium/run/<host>/<session>/last-session.md`. It reads the shapes real projects drift into as well as mycelium's templates: prose findings led by `**Setup.**`-style labels, `·`-joined fields, follow-up headings (`F-073 CORRECTION`, `F-024 RESOLVED`, `F-026 reprocess round 1`), `### D-157 — title (date)` decisions, and markers like `⛔ SUPERSEDED BY D-125` or `⚠️ SUSPECT`. A finding's `status` is the Mycelium word its Status starts with (else `unknown`); `stated` is the Status as written. Nothing here rates a finding.
+Only what agents write, never computed: `.living/findings/*.md`, `decisions.md`, `learnings.md`, `conventions.md` and `generated-conventions/*/convention.md`, `.living/log/LOG_REGISTRY.md`, `todo/TODO_REGISTRY.md` (the table and the `##` to-do sections below it), and the newest hand-written handoff among `.mycelium/last-session.md` and every `.mycelium/run/<host>/<session>/last-session.md` (the Stop hook's fallback stub only when nothing else says anything). It reads the shapes real projects drift into as well as mycelium's templates: prose findings led by `**Setup.**`-style labels, `·`-joined fields, follow-up headings (`F-073 CORRECTION`, `F-024 RESOLVED`, `F-026 reprocess round 1`), `### D-157 — title (date)` decisions, and markers like `⛔ SUPERSEDED BY D-125` or `⚠️ SUSPECT`. A finding's `status` is the Mycelium word its Status starts with (else `unknown`); `stated` is the Status as written. Nothing here rates a finding.
 
 ## The snapshot
 
@@ -27,8 +27,8 @@ The `knowledge` export returns one JSON snapshot; Chimaera passes it straight to
 | `id` | decision, learning, to-do | `D-157`, `L-4` (mycelium's positional id when a file has no explicit ones), `#50`, `T-Name` |
 | `title`, `closed`, `source` | to-do | its lead, whether the status says it is closed, `table` or `section` |
 | `left_off.sources[]` | handoff | every handoff found, newest first |
-| `conventions[]`, `sessions[]` | snapshot | `.living/conventions.md` sections and generated conventions; `LOG_REGISTRY.md` rows |
-| `asks[]` | snapshot | sentences that put something to the user, from the handoff and recent findings and decisions |
+| `conventions[]`, `sessions[]` | snapshot | `.living/conventions.md` sections and generated conventions (a heading's `(date)` moves to `date`); `LOG_REGISTRY.md` rows |
+| `asks[]` | snapshot | sentences that put something to the user, from the handoff and from recent findings and decisions the text doesn't call settled — each dated by the part (entry or follow-up) that wrote it |
 | `tidy[]` | snapshot | factual inconsistencies (reused ids, to-dos kept outside the registry, a stub handoff, twin to-dos), each with the request an agent would need |
 | `id_shapes[]`, `labels`, `guidance[]` | snapshot | the id shapes chats may turn into links, the plugin's words for the view, `MYCELIUM.md` |
 

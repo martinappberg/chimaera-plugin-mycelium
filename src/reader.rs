@@ -294,7 +294,10 @@ pub(crate) struct Finding {
 /// its newest follow-up is a resolution.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Pending {
-    asks: Vec<(String, Span)>,
+    /// Each with the day of the part that wrote it (the entry's own date, or
+    /// its follow-up's): an old ask must not look new because a later
+    /// follow-up was added.
+    asks: Vec<(String, Span, Option<i64>)>,
     /// The newest date the entry or its follow-ups carry.
     day: Option<i64>,
     own_state: bool,
@@ -470,6 +473,9 @@ pub(crate) struct Convention {
     pub(crate) title: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub(crate) status: String,
+    /// A trailing `(YYYY-MM-DD)` in the heading, else frontmatter `created`.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub(crate) date: String,
     pub(crate) span: Span,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(crate) refs: Vec<Ref>,
@@ -754,23 +760,31 @@ fn fit(k: &mut Knowledge, budget: usize, notes: &mut Notes) {
     notes.push("…and the files, scripts and jobs entries cite are left out".to_owned());
 
     // Then the oldest entries of the largest section, a tenth at a time.
-    let before = (
-        k.topics.iter().map(|t| t.findings.len()).sum::<usize>(),
-        k.decisions.len(),
-        k.learnings.len(),
-        k.todos.len(),
-        k.sessions.len(),
-    );
-    while size(k) > budget {
-        let sizes = [
-            section_size(&k.topics),
-            section_size(&k.decisions),
-            section_size(&k.learnings),
-            section_size(&k.todos),
-            section_size(&k.sessions),
-            section_size(&k.questions),
-            section_size(&k.conventions),
-        ];
+    // Only the section cut is measured again: the snapshot's size moves by
+    // exactly its change.
+    let counts = |k: &Knowledge| {
+        [
+            k.topics.iter().map(|t| t.findings.len()).sum::<usize>(),
+            k.decisions.len(),
+            k.learnings.len(),
+            k.todos.len(),
+            k.sessions.len(),
+            k.questions.len(),
+            k.conventions.len(),
+        ]
+    };
+    let before = counts(k);
+    let mut total = size(k);
+    let mut sizes = [
+        section_size(&k.topics),
+        section_size(&k.decisions),
+        section_size(&k.learnings),
+        section_size(&k.todos),
+        section_size(&k.sessions),
+        section_size(&k.questions),
+        section_size(&k.conventions),
+    ];
+    while total > budget {
         let (largest, &bytes) = sizes
             .iter()
             .enumerate()
@@ -780,7 +794,7 @@ fn fit(k: &mut Knowledge, budget: usize, notes: &mut Notes) {
             break;
         }
         let tenth = |n: usize| (n / 10).max(1);
-        match largest {
+        let now = match largest {
             // Findings: the lowest ids of the largest topic (the oldest).
             0 => {
                 if let Some(topic) = k.topics.iter_mut().max_by_key(|t| t.findings.len()) {
@@ -788,42 +802,61 @@ fn fit(k: &mut Knowledge, budget: usize, notes: &mut Notes) {
                     topic.findings.drain(..cut);
                 }
                 k.topics.retain(|t| !t.findings.is_empty());
+                section_size(&k.topics)
             }
             // Newest first: the oldest are last.
-            1 => k
-                .decisions
-                .truncate(k.decisions.len() - tenth(k.decisions.len())),
-            2 => k
-                .learnings
-                .truncate(k.learnings.len() - tenth(k.learnings.len())),
-            3 => k.todos.truncate(k.todos.len() - tenth(k.todos.len())),
-            4 => k
-                .sessions
-                .truncate(k.sessions.len() - tenth(k.sessions.len())),
-            5 => k
-                .questions
-                .truncate(k.questions.len() - tenth(k.questions.len())),
-            _ => k
-                .conventions
-                .truncate(k.conventions.len() - tenth(k.conventions.len())),
-        }
+            1 => {
+                k.decisions
+                    .truncate(k.decisions.len() - tenth(k.decisions.len()));
+                section_size(&k.decisions)
+            }
+            2 => {
+                k.learnings
+                    .truncate(k.learnings.len() - tenth(k.learnings.len()));
+                section_size(&k.learnings)
+            }
+            // File order (rows append, sections follow): closed to-dos go
+            // first, then the oldest open ones.
+            3 => {
+                let mut cut = tenth(k.todos.len());
+                k.todos.retain(|t| {
+                    let drop = cut > 0 && t.closed;
+                    cut -= usize::from(drop);
+                    !drop
+                });
+                let rest = cut.min(k.todos.len());
+                k.todos.drain(..rest);
+                section_size(&k.todos)
+            }
+            4 => {
+                k.sessions
+                    .truncate(k.sessions.len() - tenth(k.sessions.len()));
+                section_size(&k.sessions)
+            }
+            5 => {
+                k.questions
+                    .truncate(k.questions.len() - tenth(k.questions.len()));
+                section_size(&k.questions)
+            }
+            _ => {
+                k.conventions
+                    .truncate(k.conventions.len() - tenth(k.conventions.len()));
+                section_size(&k.conventions)
+            }
+        };
+        total = total - sizes[largest] + now;
+        sizes[largest] = now;
     }
-    let after = (
-        k.topics.iter().map(|t| t.findings.len()).sum::<usize>(),
-        k.decisions.len(),
-        k.learnings.len(),
-        k.todos.len(),
-        k.sessions.len(),
-    );
+    let after = counts(k);
     if after != before {
         notes.push(format!(
             "…and only the newest are shown: {} of {} findings, {} of {} decisions, {} of {} learnings, {} of {} to-dos, {} of {} sessions",
-            after.0, before.0, after.1, before.1, after.2, before.2, after.3, before.3, after.4, before.4
+            after[0], before[0], after[1], before[1], after[2], before[2], after[3], before[3], after[4], before[4]
         ));
         let open_todos = k.todos.iter().filter(|t| !t.closed).count();
-        k.counts.findings = count(after.0);
-        k.counts.decisions = count(after.1);
-        k.counts.learnings = count(after.2);
+        k.counts.findings = count(after[0]);
+        k.counts.decisions = count(after[1]);
+        k.counts.learnings = count(after[2]);
         k.counts.todos = count(open_todos);
         k.counts.open = count(open_todos + k.questions.len());
         k.counts.questions = count(k.questions.len());
@@ -2933,7 +2966,10 @@ fn parse_decisions(text: &str, rel: &str, notes: &mut Notes) -> Vec<Decision> {
                 refs,
                 cites,
                 pending: Pending {
-                    asks: asks_in(&doc, rel, std::slice::from_ref(&whole)),
+                    asks: asks_in(&doc, rel, std::slice::from_ref(&whole))
+                        .into_iter()
+                        .map(|(text, span)| (text, span, day_number(&date)))
+                        .collect(),
                     day: day_number(&date),
                     own_state: state.is_some(),
                     resolved: false,
@@ -3603,7 +3639,9 @@ fn parse_finding(
     let mut status_from_followup = false;
     let mut tags = fields.tags();
     let mut listed = Vec::with_capacity(addenda.len().min(MAX_ADDENDA));
-    let mut day = day_number(&date);
+    let own_day = day_number(&date);
+    let mut day = own_day;
+    let mut followup_days: Vec<Option<i64>> = Vec::with_capacity(addenda.len());
     for (n, addendum) in addenda.iter().enumerate() {
         let its = Fields::parse(doc, std::slice::from_ref(&addendum.body), FINDING_FIELDS);
         let its_stated = its.stated(&["status"]);
@@ -3627,9 +3665,11 @@ fn parse_finding(
             .map(str::to_owned)
             .or_else(|| its.date(&["date"]))
             .unwrap_or_default();
-        if let Some(d) = day_number(&its_date) {
+        let its_day = day_number(&its_date);
+        if let Some(d) = its_day {
             day = Some(day.map_or(d, |had| had.max(d)));
         }
+        followup_days.push(its_day);
         // The newest are listed, since they append.
         if n + MAX_ADDENDA >= addenda.len() {
             listed.push(Addendum {
@@ -3687,7 +3727,30 @@ fn parse_finding(
         refs,
         cites,
         pending: Pending {
-            asks: asks_in(doc, cx.rel, &scan),
+            asks: {
+                // The finding's own lines at its own date (an undated one at
+                // the newest it has); each follow-up's at its own.
+                let body_day = own_day.or(day);
+                let mut body: Vec<Range<usize>> = Vec::new();
+                if lead_is_finding {
+                    body.push(lead.line..lead.line + 1);
+                    body.extend(own.iter().cloned());
+                }
+                let mut asks: Vec<(String, Span, Option<i64>)> = asks_in(doc, cx.rel, &body)
+                    .into_iter()
+                    .map(|(text, span)| (text, span, body_day))
+                    .collect();
+                for (a, its_day) in addenda.iter().zip(&followup_days) {
+                    let range = a.line..a.body.end;
+                    asks.extend(
+                        asks_in(doc, cx.rel, std::slice::from_ref(&range))
+                            .into_iter()
+                            .map(|(text, span)| (text, span, its_day.or(body_day))),
+                    );
+                }
+                asks.truncate(MAX_ASKS_PER_ENTRY);
+                asks
+            },
             day,
             own_state: state.is_some(),
             resolved: addenda
@@ -3903,10 +3966,13 @@ fn is_stub(text: &str) -> bool {
     text.to_lowercase().contains(STUB_LINE)
 }
 
-/// The newest handoff by mtime that says something — the shared file wins
-/// only an exact tie — plus every handoff found, newest first. At most three
-/// are read to find one with content, and the shared file once more for the
-/// stub check.
+/// The newest hand-written handoff by mtime that says something — the
+/// shared file wins only an exact tie — plus every handoff found, newest
+/// first. The Stop hook's fallback stub is chosen only when no hand-written
+/// handoff among those read says anything: it is written at a session's end,
+/// so it is often the newest while the agent's own handoff is the real one.
+/// At most three are read to find one, and the shared file once more for
+/// the stub check.
 fn read_handoff(
     fs: &impl Fs,
     handoffs: &[Source],
@@ -3935,21 +4001,35 @@ fn read_handoff(
         })
         .collect();
     let mut texts: Vec<(&str, String)> = Vec::new();
+    // (source, its text's index in `texts`, what it parsed to).
+    let mut chosen: Option<(&Source, usize, LeftOff)> = None;
+    let mut stub: Option<(&Source, usize, LeftOff)> = None;
     for source in order.iter().take(3) {
         let Some(text) = budget.read(fs, source, notes) else {
             continue;
         };
         let parsed = parse_handoff(&text, source, notes);
+        let is_stub_text = is_stub(&text);
         texts.push((&source.rel, text));
-        let Some(mut left) = parsed else {
+        let Some(left) = parsed else {
             continue;
         };
+        let at = texts.len() - 1;
+        if is_stub_text {
+            if stub.is_none() {
+                stub = Some((source, at, left));
+            }
+            continue;
+        }
+        chosen = Some((source, at, left));
+        break;
+    }
+    if let Some((source, at, mut left)) = chosen.or(stub) {
         if let SourceKind::Handoff { session_id, host } = &source.kind {
             left.session_id.clone_from(session_id);
             left.host.clone_from(host);
         }
-        let (_, text) = texts.last().expect("pushed above");
-        let doc = Doc::new(text);
+        let doc = Doc::new(&texts[at].1);
         left.span = Some(span_of(&doc, &source.rel, 0, doc.lines.len()));
         let date = date_of_ms(source.stat.mtime_ms);
         let all = 0..doc.lines.len();
@@ -3969,7 +4049,6 @@ fn read_handoff(
             .collect();
         left.sources.clone_from(&sources);
         out.left = Some(left);
-        break;
     }
 
     // The shared handoff is the stub while the newest run handoff is
@@ -4548,7 +4627,9 @@ fn parse_conventions(text: &str, rel: &str, notes: &mut Notes) -> Vec<Convention
             .find(|&b| b > start)
             .unwrap_or(doc.lines.len());
         let (id, rest) = explicit_id(unbold(text), b'C').unwrap_or((String::new(), text));
-        let title = match plain(rest) {
+        // The heading's date moves to `date`, as for findings and decisions.
+        let (rest, date) = title_and_date(rest);
+        let title = match plain(&rest) {
             t if t.is_empty() => plain(text),
             t => t,
         };
@@ -4568,6 +4649,7 @@ fn parse_conventions(text: &str, rel: &str, notes: &mut Notes) -> Vec<Convention
             id,
             title: cap_text(title),
             status: fields.stated(&["status"]),
+            date: date.map(str::to_owned).unwrap_or_default(),
             span: span_of(&doc, rel, start, end),
             refs,
             cites,
@@ -4606,6 +4688,10 @@ fn parse_generated_convention(text: &str, rel: &str, dir: &str) -> Option<Conven
         id: meta("id").map(cap_text).unwrap_or_default(),
         title: cap_text(title),
         status: meta("status").map(cap_text).unwrap_or_default(),
+        date: meta("created")
+            .filter(|d| d.as_bytes().get(..10).is_some_and(is_iso_date))
+            .map(|d| d[..10].to_owned())
+            .unwrap_or_default(),
         span: span_of(&doc, rel, 0, doc.lines.len()),
         refs,
         cites,
@@ -4860,9 +4946,21 @@ fn inverse_rank(kind: &str) -> u8 {
     }
 }
 
+/// Whether the text says an entry is settled — superseded, retracted,
+/// corrected or resolved — so what it once put to the user no longer waits.
+fn settled(state: Option<&State>) -> bool {
+    state.is_some_and(|s| {
+        matches!(
+            s.kind,
+            "superseded" | "retracted" | "corrected" | "resolved"
+        )
+    })
+}
+
 /// "Waiting on you": the chosen handoff's asks (any date), then those of
-/// findings and decisions dated within [`ASK_WINDOW_DAYS`] of the newest
-/// dated one — newest first, deduplicated, at most [`MAX_ASKS`].
+/// findings and decisions the text doesn't call settled, each dated by the
+/// part that wrote it and kept when within [`ASK_WINDOW_DAYS`] of the newest
+/// dated entry — newest first, deduplicated, at most [`MAX_ASKS`].
 fn collect_asks(k: &Knowledge, handoff: Vec<AskItem>) -> Vec<AskItem> {
     let findings = k.topics.iter().flat_map(|t| &t.findings);
     let newest = findings
@@ -4874,11 +4972,11 @@ fn collect_asks(k: &Knowledge, handoff: Vec<AskItem>) -> Vec<AskItem> {
     if let Some(newest) = newest {
         let recent = |day: Option<i64>| day.filter(|&d| d >= newest - ASK_WINDOW_DAYS);
         let date = |day: i64| date_of_ms(u64::try_from(day).unwrap_or(0) * 86_400_000);
-        for f in findings {
-            let Some(day) = recent(f.pending.day) else {
-                continue;
-            };
-            for (text, span) in &f.pending.asks {
+        for f in findings.filter(|f| !settled(f.state.as_ref())) {
+            for (text, span, day) in &f.pending.asks {
+                let Some(day) = recent(*day) else {
+                    continue;
+                };
                 out.push(AskItem {
                     text: text.clone(),
                     date: date(day),
@@ -4891,11 +4989,11 @@ fn collect_asks(k: &Knowledge, handoff: Vec<AskItem>) -> Vec<AskItem> {
                 });
             }
         }
-        for d in &k.decisions {
-            let Some(day) = recent(d.pending.day) else {
-                continue;
-            };
-            for (text, span) in &d.pending.asks {
+        for d in k.decisions.iter().filter(|d| !settled(d.state.as_ref())) {
+            for (text, span, day) in &d.pending.asks {
+                let Some(day) = recent(*day) else {
+                    continue;
+                };
                 out.push(AskItem {
                     text: text.clone(),
                     date: date(day),

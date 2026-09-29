@@ -617,7 +617,7 @@ mod tests {
         assert_eq!(
             get_text(&k, "C-2"),
             format!(
-                "{FRAME}convention C-2 Smoke-test before submitting a batch job (2026-07-10)\n\
+                "{FRAME}convention C-2 Smoke-test before submitting a batch job\n\
                  status: active\n(.living/conventions.md:9)\n"
             )
         );
@@ -655,9 +655,7 @@ mod tests {
             .answer(&k)
             .text;
         assert!(
-            smoke.contains(
-                "- convention C-2 Smoke-test before submitting a batch job (2026-07-10)\n"
-            ),
+            smoke.contains("- convention C-2 Smoke-test before submitting a batch job\n"),
             "{smoke}"
         );
     }
