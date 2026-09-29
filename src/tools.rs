@@ -6,7 +6,8 @@
 use chimaera_plugin_api::serde_json::{json, Value};
 use chimaera_plugin_api::{ToolDef, ToolResult};
 
-use crate::reader::Knowledge;
+use crate::reader::{Finding, Knowledge, Todo};
+use crate::scan::State;
 
 /// Search hits listed.
 const SEARCH_DEFAULT: usize = 10;
@@ -141,9 +142,11 @@ fn search(k: &Knowledge, query: &str, limit: usize) -> ToolResult {
                 .flat_map(|a| [a.title.as_str(), a.text.as_str()])
                 .collect();
             let s = score(&format!(
-                "{} {} {} {} {} {}",
+                "{} {} {} {} {} {} {} {}",
                 f.id,
                 f.claim,
+                f.statement,
+                f.stated,
                 f.implications,
                 f.tags.join(" "),
                 f.questions.join(" "),
@@ -152,7 +155,13 @@ fn search(k: &Knowledge, query: &str, limit: usize) -> ToolResult {
             if s > 0 {
                 hits.push((
                     s,
-                    format!("{} [{}] {} (topic {})", f.id, f.status, f.claim, topic.slug),
+                    format!(
+                        "{} [{}] {} (topic {})",
+                        f.id,
+                        status_shown(f),
+                        f.claim,
+                        topic.slug
+                    ),
                 ));
             }
         }
@@ -200,10 +209,27 @@ fn search(k: &Knowledge, query: &str, limit: usize) -> ToolResult {
             ));
         }
     }
-    for t in &k.todos {
-        let s = score(&t.item);
+    for c in &k.conventions {
+        let s = score(&format!("{} {}", c.id, c.title));
         if s > 0 {
-            hits.push((s, format!("todo ({}, {}) {}", t.priority, t.status, t.item)));
+            let id = if c.id.is_empty() { &c.key } else { &c.id };
+            hits.push((s, format!("convention {id} {}", c.title)));
+        }
+    }
+    for t in &k.todos {
+        let s = score(&format!("{} {}", t.id, t.item));
+        if s > 0 {
+            let what = if t.title.is_empty() {
+                &t.item
+            } else {
+                &t.title
+            };
+            let id = if t.id.is_empty() {
+                String::new()
+            } else {
+                format!("{} ", t.id)
+            };
+            hits.push((s, format!("todo {id}{}{what}", todo_meta(t, false))));
         }
     }
     if hits.is_empty() {
@@ -220,9 +246,44 @@ fn search(k: &Knowledge, query: &str, limit: usize) -> ToolResult {
     ToolResult::text(out)
 }
 
-/// knowledge_get {id} — one entry in full (a finding by F-id, a decision or
-/// learning by the id knowledge_search printed). An F-id a project wrote on
-/// more than one finding reads them all.
+/// A finding's status as the agent wrote it, for a one-line hit: the
+/// Mycelium word when the Status starts with one, else the Status itself
+/// (shortened), else `unknown`.
+fn status_shown(f: &Finding) -> String {
+    if f.status != "unknown" || f.stated.is_empty() {
+        f.status.clone()
+    } else {
+        cap(&f.stated, 60)
+    }
+}
+
+/// `(high, in-progress) ` — a to-do's priority and status as written (and
+/// `closed` when asked), whichever it has.
+fn todo_meta(t: &Todo, closed: bool) -> String {
+    let parts: Vec<&str> = [t.priority.as_str(), t.status.as_str()]
+        .into_iter()
+        .chain((closed && t.closed).then_some("closed"))
+        .filter(|p| !p.is_empty())
+        .collect();
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!("({}) ", parts.join(", "))
+    }
+}
+
+/// `state: superseded by F-177`, when the text says so.
+fn state_line(state: Option<&State>) -> String {
+    state.map_or_else(String::new, |s| match &s.by {
+        Some(by) => format!("state: {} by {by}\n", s.kind),
+        None => format!("state: {}\n", s.kind),
+    })
+}
+
+/// knowledge_get {id} — one entry in full: a finding by F-id (every
+/// finding a project wrote it on) or by key (`topic/F-003`), a decision or
+/// learning by its id (`D-12`, `L-4`) or the fingerprint knowledge_search
+/// printed, a convention by `C-4`, a to-do by `#50` / `T-Name`.
 fn get(k: &Knowledge, want: &str) -> ToolResult {
     let mut out = String::from(FRAME);
     let mut found = false;
@@ -230,17 +291,26 @@ fn get(k: &Knowledge, want: &str) -> ToolResult {
         for f in topic
             .findings
             .iter()
-            .filter(|f| f.id.eq_ignore_ascii_case(want))
+            .filter(|f| f.id.eq_ignore_ascii_case(want) || f.key == want)
         {
             if found {
                 out.push('\n');
             }
             found = true;
+            out.push_str(&format!("{} — {}\n", f.id, f.claim));
+            if !f.statement.is_empty() {
+                out.push_str(&format!("claim: {}\n", f.statement));
+            }
+            out.push_str(&format!("status: {}\n", f.status));
+            if !f.stated.is_empty() && f.stated != f.status {
+                out.push_str(&format!("stated: {}\n", f.stated));
+            }
+            out.push_str(&state_line(f.state.as_ref()));
+            if !f.date.is_empty() {
+                out.push_str(&format!("date: {}\n", f.date));
+            }
             out.push_str(&format!(
-                "{} — {}\nstatus: {}\ntopic: {} ({}:{})\nimplications: {}\ntags: {}\n",
-                f.id,
-                f.claim,
-                f.status,
+                "topic: {} ({}:{})\nimplications: {}\ntags: {}\n",
                 topic.slug,
                 topic.path,
                 f.line,
@@ -285,19 +355,67 @@ fn get(k: &Knowledge, want: &str) -> ToolResult {
     if found {
         return ToolResult::text(out);
     }
-    if let Some(d) = k.decisions.iter().find(|d| d.fp == want) {
+    let by_id = |id: &str| !id.is_empty() && id.eq_ignore_ascii_case(want);
+    let decisions: Vec<_> = k
+        .decisions
+        .iter()
+        .filter(|d| d.fp == want || by_id(&d.id))
+        .collect();
+    for (n, d) in decisions.iter().enumerate() {
+        if n > 0 {
+            out.push('\n');
+        }
+        out.push_str(&format!("decision ({}) {}\n", d.date, d.title));
+        if !d.id.is_empty() {
+            out.push_str(&format!("id: {}\n", d.id));
+        }
+        if !d.stated.is_empty() {
+            out.push_str(&format!("stated: {}\n", d.stated));
+        }
+        out.push_str(&state_line(d.state.as_ref()));
         out.push_str(&format!(
-            "decision ({}) {}\ncontext: {}\ndecision: {}\nalternatives: {}\nrationale: {}\nconsequences: {}\n(.living/decisions.md:{})\n",
-            d.date, d.title, d.context, d.decision, d.alternatives.join("; "), d.rationale,
+            "context: {}\ndecision: {}\nalternatives: {}\nrationale: {}\nconsequences: {}\n(.living/decisions.md:{})\n",
+            d.context, d.decision, d.alternatives.join("; "), d.rationale,
             d.consequences, d.line
         ));
+    }
+    if !decisions.is_empty() {
         return ToolResult::text(out);
     }
-    if let Some(l) = k.learnings.iter().find(|l| l.fp == want) {
+    if let Some(l) = k.learnings.iter().find(|l| l.fp == want || by_id(&l.id)) {
         out.push_str(&format!(
             "learning ({}, {}) {}\nwhat happened: {}\nwhy it matters: {}\nresolution: {}\n(.living/learnings.md:{})\n",
             l.category, l.date, l.title, l.what, l.why, l.resolution, l.line
         ));
+        return ToolResult::text(out);
+    }
+    if let Some(c) = k.conventions.iter().find(|c| c.key == want || by_id(&c.id)) {
+        let id = if c.id.is_empty() { &c.key } else { &c.id };
+        out.push_str(&format!("convention {id} {}\n", c.title));
+        if !c.status.is_empty() {
+            out.push_str(&format!("status: {}\n", c.status));
+        }
+        out.push_str(&format!("({}:{})\n", c.span.path, c.span.line));
+        return ToolResult::text(out);
+    }
+    if let Some(t) = k.todos.iter().find(|t| t.key == want || by_id(&t.id)) {
+        let id = if t.id.is_empty() {
+            String::new()
+        } else {
+            format!("{} ", t.id)
+        };
+        out.push_str(&format!(
+            "todo {id}{}{}\n{}\n",
+            todo_meta(t, true),
+            t.title,
+            t.item
+        ));
+        if !t.file.is_empty() {
+            out.push_str(&format!("file: {}\n", t.file));
+        }
+        if let Some(span) = &t.span {
+            out.push_str(&format!("({}:{})\n", span.path, span.line));
+        }
         return ToolResult::text(out);
     }
     ToolResult::error(format!(
@@ -402,12 +520,14 @@ mod tests {
                             title: "genotype readiness".to_string(),
                             text: "238/240 donors.\n\nTwo re-queued.".to_string(),
                             line: 12,
+                            ..Addendum::default()
                         },
                         Addendum {
                             label: "Addendum (2)".to_string(),
                             title: String::new(),
                             text: "Pileup tracks BAM reads.".to_string(),
                             line: 20,
+                            ..Addendum::default()
                         },
                     ],
                     line: 3,
@@ -438,6 +558,107 @@ mod tests {
                 .contains("- F-027 [supported] CUIMC2 is complete (topic data)"),
             "{}",
             search.text
+        );
+    }
+
+    /// The reference tree (`fixtures/reference/`), read in place: nothing
+    /// here depends on its mtimes.
+    fn reference() -> Knowledge {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/reference");
+        let fs = crate::fs::StdFs::new(&root);
+        crate::reader::read(&fs, crate::reader::plan(&fs))
+    }
+
+    fn get_text(k: &Knowledge, id: &str) -> String {
+        let result = Ask::parse("knowledge_get", &json!({ "id": id }))
+            .unwrap()
+            .answer(k);
+        assert!(!result.is_error, "{id}: {}", result.text);
+        result.text
+    }
+
+    #[test]
+    fn a_finding_reads_with_its_claim_status_as_written_and_state() {
+        let k = reference();
+        // A reused id reads every finding with it; its key reads one.
+        let both = get_text(&k, "F-177");
+        assert_eq!(both.matches("F-177 — ").count(), 2, "{both}");
+        let one = get_text(&k, "sample-cohort/F-177");
+        assert_eq!(
+            one,
+            format!(
+                "{FRAME}F-177 — Sample-f inputs are already on the current reference build\n\
+                 status: unknown\n\
+                 stated: established by an independent rerun. This CORRECTS F-170.\n\
+                 date: 2026-09-03\n\
+                 topic: sample-cohort (.living/findings/sample-cohort.md:15)\n\
+                 implications: \ntags: \n"
+            )
+        );
+        let f170 = get_text(&k, "F-170");
+        assert!(f170.contains("\nstate: superseded by F-177\n"), "{f170}");
+        let f001 = get_text(&k, "assay-pipeline/F-001");
+        assert!(
+            f001.contains("\nclaim: Samples processed in batch 2 show a ~3% higher background rate than batch 1 after stage 01 filtering.\nstatus: supported\n"),
+            "{f001}"
+        );
+    }
+
+    #[test]
+    fn decisions_conventions_and_todos_read_by_their_ids() {
+        let k = reference();
+        let d = get_text(&k, "D-40");
+        assert!(d.contains("\nid: D-40\nstate: superseded by D-41\n"), "{d}");
+        // Both D-38s.
+        assert_eq!(get_text(&k, "D-38").matches("decision (").count(), 2);
+        let fp = k.decisions[0].fp.clone();
+        assert!(get_text(&k, &fp).contains("\nid: D-157\nstated: DECIDED"));
+        assert!(get_text(&k, "L-3").contains("A file's name is not its version"));
+        assert_eq!(
+            get_text(&k, "C-2"),
+            format!(
+                "{FRAME}convention C-2 Smoke-test before submitting a batch job (2026-07-10)\n\
+                 status: active\n(.living/conventions.md:9)\n"
+            )
+        );
+        let todo = get_text(&k, "T-07Linkage");
+        assert!(
+            todo.starts_with(&format!(
+                "{FRAME}todo T-07Linkage (open, user's call) stage 07's manifest order (F-190): sort first?\n"
+            )),
+            "{todo}"
+        );
+        assert!(todo.ends_with("(todo/TODO_REGISTRY.md:63)\n"), "{todo}");
+        assert!(get_text(&k, "#50").contains("todo #50 (closed) Accept several input lists"));
+    }
+
+    #[test]
+    fn search_finds_conventions_todo_sections_and_says_what_was_stated() {
+        let k = reference();
+        let hits = Ask::parse(
+            "knowledge_search",
+            &json!({"query": "manifest order", "limit": 20}),
+        )
+        .unwrap()
+        .answer(&k)
+        .text;
+        assert!(
+            hits.contains("- todo T-07Linkage (open, user's call) stage 07's manifest order (F-190): sort first?\n"),
+            "{hits}"
+        );
+        assert!(
+            hits.contains("- F-190 [finding; the fix is the user's call] Stage 07 counts inputs listed twice in the manifest twice (topic sample-cohort)\n"),
+            "{hits}"
+        );
+        let smoke = Ask::parse("knowledge_search", &json!({"query": "smoke-test"}))
+            .unwrap()
+            .answer(&k)
+            .text;
+        assert!(
+            smoke.contains(
+                "- convention C-2 Smoke-test before submitting a batch job (2026-07-10)\n"
+            ),
+            "{smoke}"
         );
     }
 
