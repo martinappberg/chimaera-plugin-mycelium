@@ -1,30 +1,36 @@
 //! Read-only reader for a workspace's mycelium project knowledge — the
-//! structured provider behind the Knowledge view
-//! (docs/timeline-knowledge-plugins-plan.md §5, §6.3; the plugin it runs
-//! in: docs/plugin-system-plan.md).
+//! structured provider behind the Knowledge view (Chimaera's
+//! docs/knowledge-redesign-plan.md, "Wire spec — what plugin 0.2.0 adds";
+//! the plugin it runs in: docs/plugin-system-plan.md).
 //!
 //! - **Read-only, always.** Agents write knowledge through mycelium's skills
 //!   and hooks; Chimaera only reads it. Nothing here creates, locks, or
 //!   rewrites a file, and `.mycelium/locks` is never touched.
-//! - **mycelium 0.7.2 is the format.** Findings (`.living/findings/<topic>.md`:
-//!   `## F-NNN: claim`, `**Status:**`, an `### Evidence Ledger` table,
-//!   `### Open Questions`), decisions and learnings (`### [YYYY-MM-DD] Title`
-//!   at column 1 + `**Field**:` lines), `todo/TODO_REGISTRY.md`, and the
-//!   `.mycelium/last-session.md` handoff (either schema mycelium's
-//!   `finalize_handoff.py` accepts). An `F-NNN addendum…` heading
-//!   (`##`–`####`) is one of finding F-NNN's `addenda`, not another finding
-//!   with its id.
-//!   Parsing matches what mycelium writes and is lenient beyond it: malformed
-//!   input degrades to fewer items plus a `warnings` line. It never errors
-//!   and never panics.
+//! - **Report what was written; never rate.** A finding's `stated` is its
+//!   Status as written, `status` the Mycelium word it starts with (else
+//!   `unknown`); nothing here computes, maps or defaults a status. States
+//!   (superseded, retracted, …) come only from markers the agent wrote.
+//! - **mycelium 0.7.2 is the format, and what agents actually write is the
+//!   input.** Findings (`.living/findings/<topic>.md`: `## F-NNN: claim` or
+//!   `## F-NNN — title (date)`, `**Status:**`, an `### Evidence Ledger`,
+//!   `### Open Questions`, prose led by `**Setup.**`-style labels, follow-up
+//!   headings — `F-NNN addendum`, `CORRECTION`, `RESOLVED`, …), decisions and
+//!   learnings (`### [YYYY-MM-DD] Title` or `### D-157 — title (date)` +
+//!   `**Field**:` lines, `·`-joined inline fields), conventions,
+//!   `todo/TODO_REGISTRY.md` (the table and the `##` to-do sections under
+//!   it), the session log registry, and the newest `.mycelium` handoff.
+//!   Malformed input degrades to fewer items plus a `warnings` line. It
+//!   never errors and never panics.
 //! - **Fence-aware.** Headings and fields inside ``` / ~~~ fences (the
 //!   CommonMark rules of mycelium's `markdown_fences.py`) or HTML comments are
 //!   content, not entries. mycelium's own `collect_entries` is not
 //!   fence-aware; an example entry in a code block must not become knowledge.
 //! - **Bounded.** A file over [`MAX_FILE_BYTES`] is skipped unread, and every
-//!   collection and text field has a cap (constants below). Symlinks are never
+//!   collection and text field has a cap (constants below; the per-entry
+//!   `refs`/`cites`/`amends` caps live in `scan.rs`). Symlinks are never
 //!   followed, so the reader cannot leave the workspace. These budgets sit
-//!   under the host's own (8 MiB a read, 4,096 entries a listing).
+//!   under the host's own (8 MiB a read, 4,096 entries a listing, a 4 MiB
+//!   snapshot).
 //! - **Through [`Fs`].** Every path is workspace-relative and answered by the
 //!   host (or, in native tests, `std::fs` under the host's rules). [`plan`]
 //!   is the metadata-only pass: its [`Plan::stamp`] lets a caller skip a
@@ -38,6 +44,11 @@ use chimaera_plugin_api::Stat;
 use serde::Serialize;
 
 use crate::fs::{is_symlink_refusal, Fs, NOT_REGULAR};
+use crate::scan::{
+    ask_sentences, cap_chars, collapse_ws, date_of_ms, day_number, first_sentence, id_at,
+    is_iso_date, own_state, paren_date, plain, scan_amends, scan_cites, scan_refs,
+    scan_retracted_ids, strip_links, trailing_date, Amend, Cite, Ref, State,
+};
 
 /// A knowledge file over this size is skipped unread. mycelium's logs are
 /// append-only prose (2 MiB is years of entries), so a bigger file is a
@@ -58,12 +69,22 @@ const MAX_SCANNED_ENTRIES: usize = 5000;
 /// a cheap [`plan`] into a crawl.
 const MAX_DIR_ENTRIES: usize = 4096;
 /// Items kept per kind (decisions, learnings, findings, todos, questions).
-/// Decisions and learnings keep the newest.
-const MAX_ENTRIES: usize = 400;
+/// Decisions and learnings keep the newest. The host's 4 MiB snapshot cap is
+/// the real bound; this one only stops a pathological file.
+const MAX_ENTRIES: usize = 1000;
+/// Conventions and sessions kept.
+const MAX_CONVENTIONS: usize = 400;
+const MAX_SESSIONS: usize = 400;
+/// `.living/generated-conventions/<name>/` directories examined.
+const MAX_GENERATED_CONVENTIONS: usize = 200;
 /// Evidence rows kept per finding: the newest, since ledgers append.
 const MAX_LEDGER_ROWS: usize = 50;
 /// Ceiling for every text field, "…" included; cuts land on a char boundary.
 const MAX_TEXT_BYTES: usize = 2 * 1024;
+/// A Tidy up row's drafted request: long enough to name every file and id.
+const MAX_ASK_BYTES: usize = 8 * 1024;
+/// A to-do's title, in chars.
+const MAX_TITLE_CHARS: usize = 160;
 const MAX_TAGS: usize = 20;
 const MAX_QUESTIONS_PER_FINDING: usize = 20;
 /// Addenda kept per finding: the newest, since they append.
@@ -71,23 +92,41 @@ const MAX_ADDENDA: usize = 50;
 /// Items kept per list (handoff blockers / next steps, a decision's
 /// alternatives).
 const MAX_LIST_ITEMS: usize = 50;
-/// `.mycelium/run/<host>/<session>/` directories examined for a fallback
-/// handoff. mycelium deletes a run dir's handoff once Stop accepts it, so
-/// only in-flight or abandoned sessions remain.
+/// `.mycelium/run/<host>/<session>/` directories examined for handoffs.
 const MAX_RUN_DIRS: usize = 256;
+/// "Waiting on you" items kept, and candidates held per entry.
+const MAX_ASKS: usize = 20;
+const MAX_ASKS_PER_ENTRY: usize = 5;
+/// Findings and decisions this many days older than the newest dated entry
+/// no longer put anything to the user.
+const ASK_WINDOW_DAYS: i64 = 14;
+/// Ids a Tidy up row lists.
+const MAX_TIDY_REFS: usize = 50;
+/// The serialized snapshot's ceiling: the host refuses one over 4 MiB
+/// outright, and adds its own fields (`recorded_by`, guidance) after.
+const SNAPSHOT_BUDGET: usize = 3 * 1024 * 1024 + 512 * 1024;
+/// A long text field's length once the snapshot is over budget: the view
+/// renders each entry's body from its `span`, so these are previews.
+const SHORT_TEXT_BYTES: usize = 280;
 const MAX_WARNINGS: usize = 50;
 
 const LIVING: &str = ".living";
 const PROTOCOL_FILE: &str = "MYCELIUM.md";
 const STATUS_BEGIN: &str = "<!-- BEGIN MYCELIUM LIFECYCLE STATUS -->";
 const STATUS_END: &str = "<!-- END MYCELIUM LIFECYCLE STATUS -->";
+/// The Stop hook's deterministic fallback handoff (`mycelium-stop-check.sh`)
+/// opens its "What was worked on" with this line.
+const STUB_LINE: &str = "completed the session work recorded in the finalized session log";
 
 // ---------------------------------------------------------------------------
 // Wire shapes
 // ---------------------------------------------------------------------------
 
 /// Everything the Knowledge view shows from mycelium. A missing source is an
-/// empty section, never an error.
+/// empty section, never an error. Fields added in 0.2.0 sit after the 0.1.3
+/// ones and are omitted when empty, so a 0.1.3-shaped input serializes what
+/// 0.1.3 did plus only what it newly has (and the constant `id_shapes` and
+/// `labels`).
 #[derive(Serialize, Clone, Debug, Default)]
 pub(crate) struct Knowledge {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -98,13 +137,56 @@ pub(crate) struct Knowledge {
     pub(crate) decisions: Vec<Decision>,
     /// Newest first; undated last.
     pub(crate) learnings: Vec<Learning>,
-    /// Registry order.
+    /// Registry table rows in file order, then the `##` to-do sections.
     pub(crate) todos: Vec<Todo>,
     /// Every finding's open questions, deduplicated.
     pub(crate) questions: Vec<OpenQuestion>,
     pub(crate) counts: Counts,
     /// Human-readable notes: skipped files, legacy formats, caps hit.
     pub(crate) warnings: Vec<String>,
+    /// `.living/conventions.md` sections in file order, then the generated
+    /// conventions by directory name.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) conventions: Vec<Convention>,
+    /// `.living/log/LOG_REGISTRY.md` rows, newest first.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) sessions: Vec<Session>,
+    /// "Waiting on you": sentences that put something to the user, newest
+    /// first.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) asks: Vec<AskItem>,
+    /// "Tidy up": factual inconsistencies in the knowledge itself — never a
+    /// status judgment.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) tidy: Vec<Tidy>,
+    /// The id shapes this plugin answers for — what a chat may turn into
+    /// chips (only ids the snapshot has).
+    pub(crate) id_shapes: Vec<IdShape>,
+    /// The plugin's words: section names, kinds, the status vocabulary.
+    pub(crate) labels: Labels,
+    /// The plugin's own guidance files (`MYCELIUM.md` when the workspace
+    /// has one); the host appends AGENTS.md, CLAUDE.md and agent memory.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) guidance: Vec<Guidance>,
+}
+
+#[derive(Serialize, Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Guidance {
+    /// Workspace-relative.
+    pub(crate) path: &'static str,
+    pub(crate) label: &'static str,
+    pub(crate) description: &'static str,
+}
+
+/// Where an entry's markdown lives: `path` workspace-relative, `line` its
+/// heading (1-based), `end_line` its last line (inclusive; trailing blank
+/// lines excluded). The reader fetches the file and renders the slice —
+/// bodies never ride the snapshot.
+#[derive(Serialize, Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Span {
+    pub(crate) path: String,
+    pub(crate) line: u32,
+    pub(crate) end_line: u32,
 }
 
 /// The session handoff ("Where we left off").
@@ -119,8 +201,24 @@ pub(crate) struct LeftOff {
     pub(crate) written_ms: u64,
     /// Workspace-relative.
     pub(crate) path: String,
-    /// Set only when no accepted handoff exists and this one came from an
-    /// in-flight `.mycelium/run/<host>/<session-id>/` — the agent's own id.
+    /// Set when the handoff came from a `.mycelium/run/<host>/<session-id>/`
+    /// directory — the agent's own id.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) host: Option<String>,
+    /// The chosen handoff, whole file.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) span: Option<Span>,
+    /// Every handoff found, newest first (the chosen one included).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) sources: Vec<HandoffSource>,
+}
+
+#[derive(Serialize, Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct HandoffSource {
+    pub(crate) path: String,
+    pub(crate) written_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) session_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -136,33 +234,79 @@ pub(crate) struct Topic {
     pub(crate) path: String,
     /// By numeric id.
     pub(crate) findings: Vec<Finding>,
+    /// Frontmatter `last_updated`.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub(crate) date: String,
 }
 
 #[derive(Serialize, Clone, Debug, Default)]
 pub(crate) struct Finding {
     /// As written, e.g. "F-003".
     pub(crate) id: String,
+    /// The heading after the id (its trailing `(date)` moved to `date`).
     pub(crate) claim: String,
-    /// preliminary | supported | robust | contradicted | unknown — mycelium
-    /// derives it from the ledger; it is read here, never computed.
+    /// preliminary | supported | robust | contradicted — the Mycelium word
+    /// the agent's Status starts with — else unknown. Read, never computed.
     pub(crate) status: String,
     pub(crate) implications: String,
     pub(crate) tags: Vec<String>,
     pub(crate) ledger: Vec<LedgerRow>,
     pub(crate) questions: Vec<String>,
-    /// Follow-ups written under `F-NNN addendum…` headings, in file order.
-    /// Their evidence rows, open questions and tags are the finding's own.
+    /// Follow-ups written under `F-NNN addendum…` / `CORRECTION` /
+    /// `RESOLVED` / … headings, in file order. Their evidence rows, open
+    /// questions and tags are the finding's own.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(crate) addenda: Vec<Addendum>,
     /// 1-based line of the `F-` heading, for "open in file".
     pub(crate) line: u32,
     /// Newest ledger date, else the topic's `last_updated`.
     pub(crate) updated: String,
+    /// `<slug>/<id>`, `~2`, `~3` for a repeat in one file: unique even when
+    /// ids collide.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub(crate) key: String,
+    /// The Status as written, markdown stripped.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub(crate) stated: String,
+    /// A trailing `(YYYY-MM-DD)` in the heading, else `**Date**:`.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub(crate) date: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) span: Option<Span>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) refs: Vec<Ref>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) cites: Vec<Cite>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) state: Option<State>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) amends: Vec<Amend>,
+    /// The `**Claim:**` statement, when the heading is a title rather than
+    /// the claim itself.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub(crate) statement: String,
+    #[serde(skip)]
+    pub(crate) pending: Pending,
+}
+
+/// What an entry holds for the final pass: its ask candidates, whether its
+/// state is its own marker (an inverse never overrides one), and whether
+/// its newest follow-up is a resolution.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Pending {
+    asks: Vec<(String, Span)>,
+    /// The newest date the entry or its follow-ups carry.
+    day: Option<i64>,
+    own_state: bool,
+    resolved: bool,
+    /// A `##` entry mycelium's index doesn't see.
+    off_index: bool,
 }
 
 #[derive(Serialize, Clone, Debug, Default)]
 pub(crate) struct Addendum {
-    /// The heading's word and qualifier, e.g. "Addendum (2)".
+    /// The heading's word and qualifier, e.g. "Addendum (2)", "CORRECTION
+    /// (2026-07-23)", "Update".
     pub(crate) label: String,
     /// The heading after its separator; may be empty.
     pub(crate) title: String,
@@ -171,6 +315,15 @@ pub(crate) struct Addendum {
     pub(crate) text: String,
     /// 1-based line of its heading.
     pub(crate) line: u32,
+    /// addendum | correction | resolution | update
+    #[serde(skip_serializing_if = "str::is_empty")]
+    pub(crate) kind: &'static str,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub(crate) date: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub(crate) stated: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) span: Option<Span>,
 }
 
 #[derive(Serialize, Clone, Debug, Default)]
@@ -186,7 +339,8 @@ pub(crate) struct LedgerRow {
 
 #[derive(Serialize, Clone, Debug, Default)]
 pub(crate) struct Decision {
-    /// [`fingerprint`] — mycelium's `D-N` ids are positional and renumber.
+    /// [`fingerprint`] of the heading's own date and title (as 0.1.3 read
+    /// them, so it never moves) — mycelium's `D-N` ids are positional.
     pub(crate) fp: String,
     pub(crate) date: String,
     pub(crate) title: String,
@@ -197,11 +351,29 @@ pub(crate) struct Decision {
     pub(crate) consequences: String,
     pub(crate) tags: Vec<String>,
     pub(crate) line: u32,
+    /// Explicit in the heading (`D-157`, `D1` → `D-1`), else mycelium's
+    /// positional `D-<n>` when no entry in the file has an explicit id.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub(crate) id: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub(crate) stated: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) span: Option<Span>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) refs: Vec<Ref>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) cites: Vec<Cite>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) state: Option<State>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) amends: Vec<Amend>,
+    #[serde(skip)]
+    pub(crate) pending: Pending,
 }
 
 #[derive(Serialize, Clone, Debug, Default)]
 pub(crate) struct Learning {
-    /// [`fingerprint`] — mycelium's `L-N` ids are positional and renumber.
+    /// [`fingerprint`] — as for decisions.
     pub(crate) fp: String,
     pub(crate) date: String,
     pub(crate) title: String,
@@ -212,6 +384,17 @@ pub(crate) struct Learning {
     pub(crate) resolution: String,
     pub(crate) tags: Vec<String>,
     pub(crate) line: u32,
+    /// As for decisions, with `L-`.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub(crate) id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) span: Option<Span>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) refs: Vec<Ref>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) cites: Vec<Cite>,
+    #[serde(skip)]
+    pub(crate) pending: Pending,
 }
 
 #[derive(Serialize, Clone, Debug, Default)]
@@ -224,7 +407,32 @@ pub(crate) struct Todo {
     pub(crate) author: String,
     /// The item's writeup, workspace-relative (the registry links it relative
     /// to `todo/`); verbatim when absolute, a URL, or escaping the workspace.
+    /// Only a real link: a free-text File cell's ids are `refs`, its paths
+    /// `cites`.
     pub(crate) file: String,
+    /// `todo/<id>`, `todo/r<row>` for an id-less table row, `todo/s<n>` for
+    /// an id-less section.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub(crate) key: String,
+    /// `#50`, `T-GroupTiers`, or empty.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub(crate) id: String,
+    /// The item's lead: its bold opening, else its first sentence; markdown
+    /// stripped, ≤ 160 chars.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub(crate) title: String,
+    /// The status starts with a closed word (`done 2026-09-23 …`), or a
+    /// section's heading says ✅ / DONE / COMPLETE.
+    pub(crate) closed: bool,
+    /// table | section
+    #[serde(skip_serializing_if = "str::is_empty")]
+    pub(crate) source: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) span: Option<Span>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) refs: Vec<Ref>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) cites: Vec<Cite>,
 }
 
 #[derive(Serialize, Clone, Debug, Default)]
@@ -232,6 +440,9 @@ pub(crate) struct OpenQuestion {
     pub(crate) text: String,
     /// The F-id that raised it.
     pub(crate) finding: String,
+    /// The raising finding's `key`.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub(crate) key: String,
 }
 
 #[derive(Serialize, Clone, Debug, Default)]
@@ -239,8 +450,136 @@ pub(crate) struct Counts {
     pub(crate) findings: u32,
     pub(crate) decisions: u32,
     pub(crate) learnings: u32,
-    /// Todos not complete / wont-do, plus open questions.
+    /// Open to-dos plus open questions.
     pub(crate) open: u32,
+    /// Open to-dos.
+    pub(crate) todos: u32,
+    pub(crate) questions: u32,
+    pub(crate) conventions: u32,
+    pub(crate) sessions: u32,
+}
+
+#[derive(Serialize, Clone, Debug, Default)]
+pub(crate) struct Convention {
+    /// `conventions/<id>`, `conventions/s<n>` for an id-less section,
+    /// `generated-conventions/<dir>`.
+    pub(crate) key: String,
+    /// A leading `C-N`, or a generated convention's frontmatter `id`.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub(crate) id: String,
+    pub(crate) title: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub(crate) status: String,
+    pub(crate) span: Span,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) refs: Vec<Ref>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) cites: Vec<Cite>,
+}
+
+#[derive(Serialize, Clone, Debug, Default)]
+pub(crate) struct Session {
+    pub(crate) id: String,
+    pub(crate) date: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub(crate) branch: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub(crate) duration: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub(crate) files: String,
+    pub(crate) summary: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub(crate) outputs: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub(crate) status: String,
+    /// The Log cell's link, workspace-relative.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub(crate) log: String,
+}
+
+#[derive(Serialize, Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct AskItem {
+    /// The sentence, markdown stripped, ≤ 300 chars.
+    pub(crate) text: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub(crate) date: String,
+    pub(crate) source: AskSource,
+    pub(crate) span: Span,
+}
+
+/// Where an ask was written: a finding (`key` its key), a decision (`key`
+/// its fingerprint) or the handoff (`key` its path, `id` its session).
+#[derive(Serialize, Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct AskSource {
+    pub(crate) kind: &'static str,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub(crate) id: String,
+    pub(crate) key: String,
+}
+
+#[derive(Serialize, Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Tidy {
+    /// duplicate-id | off-index | handoff-stub | duplicate-todo
+    pub(crate) kind: &'static str,
+    pub(crate) text: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) refs: Vec<Ref>,
+    /// The full request an agent would need, naming files and ids.
+    pub(crate) ask: String,
+}
+
+#[derive(Serialize, Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct IdShape {
+    pub(crate) kind: &'static str,
+    /// A JavaScript-compatible regex source, without anchors.
+    pub(crate) pattern: &'static str,
+}
+
+#[derive(Serialize, Clone, Debug, Default)]
+pub(crate) struct Labels {
+    /// The source chip.
+    pub(crate) source: &'static str,
+    pub(crate) sections: SectionLabels,
+    pub(crate) kinds: KindLabels,
+    pub(crate) status_words: Vec<StatusWord>,
+    /// Who sets the status — the legend.
+    pub(crate) status_note: &'static str,
+}
+
+#[derive(Serialize, Clone, Debug, Default)]
+pub(crate) struct SectionLabels {
+    pub(crate) overview: &'static str,
+    pub(crate) left_off: &'static str,
+    pub(crate) asks: &'static str,
+    pub(crate) changed: &'static str,
+    pub(crate) open_work: &'static str,
+    pub(crate) findings: &'static str,
+    pub(crate) decisions: &'static str,
+    pub(crate) learnings: &'static str,
+    pub(crate) conventions: &'static str,
+    pub(crate) todos: &'static str,
+    pub(crate) sessions: &'static str,
+    pub(crate) tidy: &'static str,
+}
+
+/// Singular display words per kind.
+#[derive(Serialize, Clone, Debug, Default)]
+pub(crate) struct KindLabels {
+    pub(crate) finding: &'static str,
+    pub(crate) decision: &'static str,
+    pub(crate) learning: &'static str,
+    pub(crate) convention: &'static str,
+    pub(crate) todo: &'static str,
+    pub(crate) session: &'static str,
+}
+
+#[derive(Serialize, Clone, Debug, Default)]
+pub(crate) struct StatusWord {
+    pub(crate) word: &'static str,
+    /// 1–3 on mycelium's ladder; 0 for none.
+    pub(crate) rank: u8,
+    /// neutral | accent | good | warn | bad (ui/1's tones)
+    pub(crate) tone: &'static str,
 }
 
 /// What [`read`] would read, by metadata: equal stamps mean a cached
@@ -266,41 +605,41 @@ pub(crate) struct Stamp {
 /// knowledge.
 pub(crate) fn read(fs: &impl Fs, plan: Plan) -> Knowledge {
     let Plan {
-        sources, mut notes, ..
+        sources,
+        handoffs,
+        protocol,
+        mut notes,
+        ..
     } = plan;
     let mut knowledge = Knowledge::default();
+    if protocol.is_some() {
+        knowledge.guidance.push(Guidance {
+            path: PROTOCOL_FILE,
+            label: PROTOCOL_FILE,
+            description: "How agents record knowledge here",
+        });
+    }
+    let mut budget = Budget::default();
+    let handoff = read_handoff(fs, &handoffs, &mut budget, &mut notes);
     let mut topics = Vec::new();
-    let mut spent = 0u64;
-    let mut over_budget = 0usize;
     // Topic sources arrive in slug order, so spending this budget as they
     // parse keeps exactly the first findings by (slug, id).
     let mut finding_budget = MAX_ENTRIES;
     let mut findings_seen = 0usize;
     let mut topics_unread = 0usize;
+    let mut todo_sections = Vec::new();
     for source in &sources {
         if matches!(source.kind, SourceKind::Topic { .. }) && finding_budget == 0 {
             topics_unread += 1;
             continue;
         }
-        // An oversized file is read_source's to report, not the budget's.
-        let len = source.stat.size;
-        if len <= MAX_FILE_BYTES && spent + len > MAX_TOTAL_BYTES {
-            over_budget += 1;
-            continue;
-        }
-        let Some(text) = read_source(fs, source, &mut notes) else {
+        let Some(text) = budget.read(fs, source, &mut notes) else {
             continue;
         };
-        spent += text.len() as u64;
         let rel = source.rel.as_str();
         match &source.kind {
-            SourceKind::Handoff { session_id, host } => {
-                knowledge.left_off = parse_handoff(&text, source, &mut notes).map(|mut left| {
-                    left.session_id.clone_from(session_id);
-                    left.host.clone_from(host);
-                    left
-                });
-            }
+            // Planned separately (`Plan::handoffs`), read above.
+            SourceKind::Handoff { .. } => {}
             SourceKind::Topic { slug } => {
                 let (topic, found) = parse_topic(&text, rel, slug, finding_budget, &mut notes);
                 findings_seen += found;
@@ -311,18 +650,26 @@ pub(crate) fn read(fs: &impl Fs, plan: Plan) -> Knowledge {
             }
             SourceKind::Decisions => knowledge.decisions = parse_decisions(&text, rel, &mut notes),
             SourceKind::Learnings => knowledge.learnings = parse_learnings(&text, rel, &mut notes),
-            SourceKind::TodoRegistry => {
-                knowledge.todos = parse_todos(&text, rel, false, &mut notes)
+            SourceKind::TodoRegistry | SourceKind::TodoLegacy => {
+                let legacy = matches!(source.kind, SourceKind::TodoLegacy);
+                let (todos, sections) = parse_todos(&text, rel, legacy, &mut notes);
+                knowledge.todos = todos;
+                todo_sections = sections;
             }
-            SourceKind::TodoLegacy => knowledge.todos = parse_todos(&text, rel, true, &mut notes),
+            SourceKind::Conventions => {
+                knowledge.conventions = parse_conventions(&text, rel, &mut notes);
+            }
+            SourceKind::GeneratedConvention { dir } => {
+                knowledge
+                    .conventions
+                    .extend(parse_generated_convention(&text, rel, dir));
+            }
+            SourceKind::LogRegistry => {
+                knowledge.sessions = parse_sessions(&text, rel, &mut notes);
+            }
         }
     }
-    if over_budget > 0 {
-        notes.push(format!(
-            "{over_budget} knowledge files not read: the {} per-read budget was spent",
-            mib(MAX_TOTAL_BYTES)
-        ));
-    }
+    budget.note(&mut notes);
     let shown: usize = topics.iter().map(|t| t.findings.len()).sum();
     if findings_seen > shown || topics_unread > 0 {
         let unread = if topics_unread > 0 {
@@ -333,6 +680,13 @@ pub(crate) fn read(fs: &impl Fs, plan: Plan) -> Knowledge {
         notes.push(format!(
             "findings: showing the first {shown} of {findings_seen}{unread}"
         ));
+    }
+    if knowledge.conventions.len() > MAX_CONVENTIONS {
+        notes.push(format!(
+            "conventions: showing the first {MAX_CONVENTIONS} of {}",
+            knowledge.conventions.len()
+        ));
+        knowledge.conventions.truncate(MAX_CONVENTIONS);
     }
     topics.sort_by(|a, b| a.slug.cmp(&b.slug));
 
@@ -350,6 +704,7 @@ pub(crate) fn read(fs: &impl Fs, plan: Plan) -> Knowledge {
             knowledge.questions.push(OpenQuestion {
                 text: question.clone(),
                 finding: finding.id.clone(),
+                key: finding.key.clone(),
             });
         }
     }
@@ -359,21 +714,124 @@ pub(crate) fn read(fs: &impl Fs, plan: Plan) -> Knowledge {
             MAX_ENTRIES + dropped
         ));
     }
-
-    let open_todos = knowledge
-        .todos
-        .iter()
-        .filter(|t| !is_closed(&t.status))
-        .count();
-    knowledge.counts = Counts {
-        findings: count(topics.iter().map(|t| t.findings.len()).sum()),
-        decisions: count(knowledge.decisions.len()),
-        learnings: count(knowledge.learnings.len()),
-        open: count(open_todos + knowledge.questions.len()),
-    };
     knowledge.topics = topics;
+    finish(&mut knowledge, handoff, &todo_sections);
+    fit(&mut knowledge, SNAPSHOT_BUDGET, &mut notes);
     knowledge.warnings = notes.finish();
     knowledge
+}
+
+/// Keeps the serialized snapshot under `budget`, cheapest loss first: the
+/// long text fields shortened (the files hold them in full, and the view
+/// reads bodies from `span`), then every entry's `cites`, then the oldest
+/// learnings and decisions. Each step says so in `warnings`.
+fn fit(k: &mut Knowledge, budget: usize, notes: &mut Notes) {
+    let size =
+        |k: &Knowledge| chimaera_plugin_api::serde_json::to_vec(k).map_or(usize::MAX, |v| v.len());
+    let over = size(k);
+    if over <= budget {
+        return;
+    }
+    let short = |s: &mut String| {
+        if s.len() > SHORT_TEXT_BYTES {
+            *s = cap_bytes(std::mem::take(s), SHORT_TEXT_BYTES);
+        }
+    };
+    for f in k.topics.iter_mut().flat_map(|t| t.findings.iter_mut()) {
+        short(&mut f.implications);
+        short(&mut f.statement);
+        f.addenda.iter_mut().for_each(|a| short(&mut a.text));
+        f.ledger.iter_mut().for_each(|r| short(&mut r.result));
+    }
+    for d in &mut k.decisions {
+        for s in [
+            &mut d.context,
+            &mut d.decision,
+            &mut d.rationale,
+            &mut d.consequences,
+        ] {
+            short(s);
+        }
+        d.alternatives.iter_mut().for_each(short);
+    }
+    for l in &mut k.learnings {
+        for s in [&mut l.what, &mut l.why, &mut l.resolution] {
+            short(s);
+        }
+    }
+    k.todos.iter_mut().for_each(|t| short(&mut t.item));
+    let mib = |n: usize| format!("{:.1} MiB", n as f64 / (1024.0 * 1024.0));
+    notes.push(format!(
+        "the snapshot was {}, over its {} budget: long text fields are shortened to {SHORT_TEXT_BYTES} bytes (the files hold them in full)",
+        mib(over),
+        mib(budget)
+    ));
+    if size(k) <= budget {
+        return;
+    }
+    for f in k.topics.iter_mut().flat_map(|t| t.findings.iter_mut()) {
+        f.cites.clear();
+    }
+    k.decisions.iter_mut().for_each(|d| d.cites.clear());
+    k.learnings.iter_mut().for_each(|l| l.cites.clear());
+    k.todos.iter_mut().for_each(|t| t.cites.clear());
+    k.conventions.iter_mut().for_each(|c| c.cites.clear());
+    notes.push("…and the files, scripts and jobs entries cite are left out".to_owned());
+    // Newest first, so the oldest go: a tenth of the longer list at a time.
+    let (learnings, decisions) = (k.learnings.len(), k.decisions.len());
+    while size(k) > budget && !(k.learnings.is_empty() && k.decisions.is_empty()) {
+        let list = if k.learnings.len() >= k.decisions.len() {
+            k.learnings.len()
+        } else {
+            k.decisions.len()
+        };
+        let cut = (list / 10).max(1);
+        if k.learnings.len() >= k.decisions.len() {
+            k.learnings.truncate(list - cut);
+        } else {
+            k.decisions.truncate(list - cut);
+        }
+    }
+    if k.learnings.len() < learnings || k.decisions.len() < decisions {
+        notes.push(format!(
+            "…and only the newest {} of {learnings} learnings and {} of {decisions} decisions are shown",
+            k.learnings.len(),
+            k.decisions.len()
+        ));
+        k.counts.learnings = count(k.learnings.len());
+        k.counts.decisions = count(k.decisions.len());
+    }
+}
+
+/// Bytes read so far by one [`read`], against [`MAX_TOTAL_BYTES`].
+#[derive(Default)]
+struct Budget {
+    spent: u64,
+    over: usize,
+}
+
+impl Budget {
+    fn read(&mut self, fs: &impl Fs, source: &Source, notes: &mut Notes) -> Option<String> {
+        // An oversized file is read_source's to report, not the budget's.
+        let len = source.stat.size;
+        if len <= MAX_FILE_BYTES && self.spent + len > MAX_TOTAL_BYTES {
+            self.over += 1;
+            return None;
+        }
+        let text = read_source(fs, source, notes)?;
+        self.spent += text.len() as u64;
+        Some(text)
+    }
+
+    fn note(&self, notes: &mut Notes) {
+        if self.over > 0 {
+            notes.push(format!(
+                "{} knowledge files not read: the {} per-read budget was spent",
+                self.over,
+                mib(MAX_TOTAL_BYTES)
+            ));
+        }
+    }
 }
 
 /// A stable id for a decision or learning: FNV-1a 64 over the normalized
@@ -414,6 +872,11 @@ enum SourceKind {
     Learnings,
     TodoRegistry,
     TodoLegacy,
+    Conventions,
+    GeneratedConvention {
+        dir: String,
+    },
+    LogRegistry,
 }
 
 #[derive(Debug)]
@@ -430,6 +893,12 @@ struct Source {
 #[derive(Default)]
 pub(crate) struct Plan {
     sources: Vec<Source>,
+    /// Every handoff found: all are stamped (a new one changes `sources`),
+    /// only the newest few are read.
+    handoffs: Vec<Source>,
+    /// `MYCELIUM.md`'s stat: its presence is the `guidance` entry, so it is
+    /// stamped though never read.
+    protocol: Option<Stat>,
     refused: Vec<String>,
     notes: Notes,
 }
@@ -439,9 +908,15 @@ impl Plan {
     pub(crate) fn stamp(&self) -> Stamp {
         Stamp {
             files: self
-                .sources
+                .handoffs
                 .iter()
+                .chain(&self.sources)
                 .map(|s| (s.rel.clone(), s.stat.mtime_ms, s.stat.size))
+                .chain(
+                    self.protocol
+                        .as_ref()
+                        .map(|p| (PROTOCOL_FILE.to_owned(), p.mtime_ms, p.size)),
+                )
                 .collect(),
             refused: self.refused.clone(),
         }
@@ -514,28 +989,35 @@ impl Plan {
 pub(crate) fn plan(fs: &impl Fs) -> Plan {
     let mut plan = Plan::default();
     let living = plan.dir(fs, LIVING);
-    if !living && !is_file(fs, PROTOCOL_FILE) {
+    let protocol = fs.stat(PROTOCOL_FILE).ok().filter(|stat| !stat.is_dir);
+    if !living && protocol.is_none() {
         return plan;
     }
+    plan.protocol = protocol;
     // Topic files go last: they are the many-file source, so they are what
     // a spent MAX_TOTAL_BYTES budget should drop.
-    plan_handoff(fs, &mut plan);
+    plan_handoffs(fs, &mut plan);
     if living {
         plan.file(fs, ".living/decisions.md", SourceKind::Decisions);
         plan.file(fs, ".living/learnings.md", SourceKind::Learnings);
+        plan.file(fs, ".living/conventions.md", SourceKind::Conventions);
+        plan.file(fs, ".living/log/LOG_REGISTRY.md", SourceKind::LogRegistry);
     }
     if plan.dir(fs, "todo") && !plan.file(fs, "todo/TODO_REGISTRY.md", SourceKind::TodoRegistry) {
         plan.file(fs, "todo/TODOLIST.md", SourceKind::TodoLegacy);
     }
     if living {
+        plan_generated_conventions(fs, &mut plan);
         plan_topics(fs, &mut plan);
     }
     plan
 }
 
-/// The accepted shared handoff, else the newest in-flight run handoff
-/// (`.mycelium/run/<host>/<session-id>/last-session.md`).
-fn plan_handoff(fs: &impl Fs, plan: &mut Plan) {
+/// Every handoff: the shared `.mycelium/last-session.md` and each
+/// `.mycelium/run/<host>/<session-id>/last-session.md`. The read picks the
+/// newest by mtime — the Stop hook's fallback stub in the shared file must
+/// not hide a hand-written run handoff written after it.
+fn plan_handoffs(fs: &impl Fs, plan: &mut Plan) {
     if !plan.dir(fs, ".mycelium") {
         return;
     }
@@ -543,44 +1025,61 @@ fn plan_handoff(fs: &impl Fs, plan: &mut Plan) {
         session_id: None,
         host: None,
     };
-    if plan.file(fs, ".mycelium/last-session.md", shared) || !plan.dir(fs, ".mycelium/run") {
+    let mut found: Vec<Source> = plan
+        .probe(fs, ".mycelium/last-session.md", shared)
+        .into_iter()
+        .collect();
+    if plan.dir(fs, ".mycelium/run") {
+        let mut examined = 0usize;
+        'hosts: for host in plan.list(fs, ".mycelium/run") {
+            let host_rel = format!(".mycelium/run/{host}");
+            if !is_run_component(&host) || !plan.dir(fs, &host_rel) {
+                continue;
+            }
+            for session in plan.list(fs, &host_rel) {
+                examined += 1;
+                if examined > MAX_RUN_DIRS {
+                    plan.notes.push(format!(
+                        ".mycelium/run: over {MAX_RUN_DIRS} session directories; the rest were not searched for a handoff"
+                    ));
+                    break 'hosts;
+                }
+                let dir_rel = format!("{host_rel}/{session}");
+                if !is_run_component(&session) || !plan.dir(fs, &dir_rel) {
+                    continue;
+                }
+                let kind = SourceKind::Handoff {
+                    session_id: Some(session.clone()),
+                    host: Some(host.clone()),
+                };
+                found.extend(plan.probe(fs, &format!("{dir_rel}/last-session.md"), kind));
+            }
+        }
+    }
+    plan.handoffs = found;
+}
+
+/// `.living/generated-conventions/<name>/convention.md`, by name.
+fn plan_generated_conventions(fs: &impl Fs, plan: &mut Plan) {
+    const DIR: &str = ".living/generated-conventions";
+    if !plan.dir(fs, DIR) {
         return;
     }
-    let mut best: Option<Source> = None;
-    let mut examined = 0usize;
-    'hosts: for host in plan.list(fs, ".mycelium/run") {
-        let host_rel = format!(".mycelium/run/{host}");
-        if !is_run_component(&host) || !plan.dir(fs, &host_rel) {
-            continue;
-        }
-        for session in plan.list(fs, &host_rel) {
-            examined += 1;
-            if examined > MAX_RUN_DIRS {
-                plan.notes.push(format!(
-                    ".mycelium/run: over {MAX_RUN_DIRS} session directories; the rest were not searched for a handoff"
-                ));
-                break 'hosts;
-            }
-            let dir_rel = format!("{host_rel}/{session}");
-            if !is_run_component(&session) || !plan.dir(fs, &dir_rel) {
-                continue;
-            }
-            let kind = SourceKind::Handoff {
-                session_id: Some(session.clone()),
-                host: Some(host.clone()),
-            };
-            let Some(found) = plan.probe(fs, &format!("{dir_rel}/last-session.md"), kind) else {
-                continue;
-            };
-            let newer = best
-                .as_ref()
-                .is_none_or(|b| (found.stat.mtime_ms, &found.rel) > (b.stat.mtime_ms, &b.rel));
-            if newer {
-                best = Some(found);
-            }
-        }
+    let names: Vec<String> = plan
+        .list(fs, DIR)
+        .into_iter()
+        .filter(|n| is_run_component(n) && !n.starts_with('.'))
+        .collect();
+    if names.len() > MAX_GENERATED_CONVENTIONS {
+        plan.notes.push(format!(
+            "{DIR}: {} entries; read the first {MAX_GENERATED_CONVENTIONS} by name",
+            names.len()
+        ));
     }
-    plan.sources.extend(best);
+    for name in names.into_iter().take(MAX_GENERATED_CONVENTIONS) {
+        let rel = format!("{DIR}/{name}/convention.md");
+        plan.file(fs, &rel, SourceKind::GeneratedConvention { dir: name });
+    }
 }
 
 fn plan_topics(fs: &impl Fs, plan: &mut Plan) {
@@ -625,11 +1124,6 @@ fn is_run_component(name: &str) -> bool {
         && name
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
-}
-
-/// A file (not a directory) at `rel`, never through a symlink.
-fn is_file(fs: &impl Fs, rel: &str) -> bool {
-    fs.stat(rel).is_ok_and(|stat| !stat.is_dir)
 }
 
 /// Bounded read of a planned file. Refuses anything that stopped being the
@@ -1047,21 +1541,22 @@ fn unquote(value: &str) -> &str {
 // ---------------------------------------------------------------------------
 
 /// Cut to [`MAX_TEXT_BYTES`] (the "…" included) on a char boundary.
-fn cap_text(mut s: String) -> String {
-    if s.len() <= MAX_TEXT_BYTES {
+fn cap_text(s: String) -> String {
+    cap_bytes(s, MAX_TEXT_BYTES)
+}
+
+/// Cut to `max` bytes (the "…" included) on a char boundary.
+fn cap_bytes(mut s: String, max: usize) -> String {
+    if s.len() <= max {
         return s;
     }
-    let mut end = MAX_TEXT_BYTES - '…'.len_utf8();
+    let mut end = max - '…'.len_utf8();
     while !s.is_char_boundary(end) {
         end -= 1;
     }
     s.truncate(end);
     s.push('…');
     s
-}
-
-fn collapse_ws(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Joined lines, trimmed, with each run of blank lines collapsed to one.
@@ -1104,46 +1599,12 @@ fn strip_inline_comments(line: &str) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
-/// `[text](target)` → `text` (images too), plus the first link's target.
-fn strip_links(s: &str) -> (String, Option<String>) {
-    let mut out = String::with_capacity(s.len());
-    let mut target = None;
-    let mut rest = s;
-    while let Some(open) = rest.find('[') {
-        let Some(close) = rest[open..].find("](").map(|at| open + at) else {
-            break;
-        };
-        let Some(end) = rest[close + 2..].find(')').map(|at| close + 2 + at) else {
-            break;
-        };
-        let before = &rest[..open];
-        out.push_str(before.strip_suffix('!').unwrap_or(before));
-        out.push_str(&rest[open + 1..close]);
-        if target.is_none() {
-            // `(path "title")`: the path is the first token.
-            let link = rest[close + 2..end].split_whitespace().next().unwrap_or("");
-            target = Some(link.trim_matches(['<', '>']).to_owned());
-        }
-        rest = &rest[end + 1..];
-    }
-    out.push_str(rest);
-    (out, target)
-}
-
 fn unbold(s: &str) -> &str {
     let t = s.trim();
     match t.strip_prefix("**").and_then(|t| t.strip_suffix("**")) {
         Some(inner) if !inner.trim().is_empty() => inner.trim(),
         _ => t,
     }
-}
-
-fn is_iso_date(b: &[u8]) -> bool {
-    b.len() == 10
-        && b.iter().enumerate().all(|(i, c)| match i {
-            4 | 7 => *c == b'-',
-            _ => c.is_ascii_digit(),
-        })
 }
 
 /// A heading's leading date and title — a port of mycelium's
@@ -1268,28 +1729,35 @@ fn normalize_direction(value: &str) -> String {
 }
 
 /// mycelium's closed todo statuses (`complete`, `wont-do`) and their obvious
-/// spellings.
+/// spellings, as the status's FIRST word: `done 2026-09-23 (applied …)`,
+/// `**done**`, `won't do — superseded` are closed; `half done`, `not done`
+/// are not.
 fn is_closed(status: &str) -> bool {
+    const CLOSED: &[&str] = &[
+        "complete",
+        "completed",
+        "done",
+        "closed",
+        "resolved",
+        "wont-do",
+        "wontdo",
+        "wont-fix",
+        "wontfix",
+        "cancelled",
+        "canceled",
+        "dropped",
+    ];
     let norm: String = status
         .to_lowercase()
         .chars()
-        .filter(|c| !matches!(c, '\'' | '’' | '`'))
+        .filter(|c| !matches!(c, '\'' | '’' | '`' | '*'))
         .map(|c| if c == ' ' || c == '_' { '-' } else { c })
         .collect();
-    matches!(
-        norm.trim_matches('-'),
-        "complete"
-            | "completed"
-            | "done"
-            | "closed"
-            | "wont-do"
-            | "wontdo"
-            | "wont-fix"
-            | "wontfix"
-            | "cancelled"
-            | "canceled"
-            | "dropped"
-    )
+    let norm = norm.trim_matches('-');
+    CLOSED.iter().any(|word| {
+        norm.strip_prefix(word)
+            .is_some_and(|rest| !rest.starts_with(|c: char| c.is_alphanumeric()))
+    })
 }
 
 /// Tags as `[a, b]`, `a, b`, or `#a #b`; deduplicated case-insensitively.
@@ -1303,7 +1771,11 @@ fn parse_tags(raw: &str, tags: &mut Vec<String>) {
         .and_then(|r| r.strip_suffix(']'))
         .unwrap_or(raw);
     for piece in raw.split(',') {
-        let piece = piece.trim();
+        let piece = piece.trim().trim_end_matches('.');
+        // `mitigation_type=process` is a key, not a tag.
+        if piece.contains('=') {
+            continue;
+        }
         let words: Vec<&str> = piece.split_whitespace().collect();
         if words.len() > 1 && words.iter().all(|w| w.starts_with('#')) {
             for word in words {
@@ -1485,16 +1957,140 @@ fn is_separator(cells: &[String]) -> bool {
             .all(|c| !c.is_empty() && c.chars().all(|ch| matches!(ch, '-' | ':' | ' ')))
 }
 
-/// A table cell as plain text: links unwrapped, backticks and a lone
-/// dash/em-dash ("nothing here") dropped.
+/// A table cell as text: links unwrapped, a cell that is one code span
+/// (`` `blocked` ``) unwrapped, a lone dash/em-dash ("nothing here")
+/// dropped. Code spans inside it stay whole ("Fix `a` and `b`").
 fn cell_text(cell: &str) -> String {
     let (text, _) = strip_links(cell);
-    let text = text.trim().trim_matches('`').trim();
+    let text = text.trim();
+    let text = match text.strip_prefix('`').and_then(|t| t.strip_suffix('`')) {
+        Some(inner) if !inner.contains('`') => inner.trim(),
+        _ => text,
+    };
     if matches!(text, "-" | "—" | "–") {
         String::new()
     } else {
         cap_text(text.to_owned())
     }
+}
+
+/// A [`Span`] over 0-based lines `start..end` (exclusive), trailing blank
+/// lines excluded.
+fn span_of(doc: &Doc, rel: &str, start: usize, end: usize) -> Span {
+    let mut last = end.min(doc.lines.len()).max(start + 1);
+    while last > start + 1 && doc.lines[last - 1].trim().is_empty() {
+        last -= 1;
+    }
+    Span {
+        path: rel.to_owned(),
+        line: line_no(start),
+        end_line: line_no(last - 1),
+    }
+}
+
+/// The text lines of `ranges` (fences and comments skipped) as paragraphs:
+/// runs of non-blank lines, where a heading or a list item starts its own.
+/// Each is `(first line, last line, joined text)`, lines 0-based.
+fn paragraphs_in(doc: &Doc, ranges: &[Range<usize>]) -> Vec<(usize, usize, String)> {
+    let mut out: Vec<(usize, usize, String)> = Vec::new();
+    for range in ranges {
+        let mut open = false;
+        for i in range.start..range.end.min(doc.lines.len()) {
+            let Some(line) = doc.text(i) else {
+                open = false;
+                continue;
+            };
+            let body = line.trim();
+            if body.is_empty() {
+                open = false;
+                continue;
+            }
+            let is_heading = heading(line).is_some();
+            let starts = is_heading || !open || list_marker(body).is_some();
+            let text = heading(line).map_or(body, |(_, text)| text);
+            match out.last_mut() {
+                Some(last) if !starts => {
+                    last.1 = i;
+                    last.2.push(' ');
+                    last.2.push_str(text);
+                }
+                _ => out.push((i, i, text.to_owned())),
+            }
+            open = !is_heading;
+        }
+    }
+    out
+}
+
+/// The first paragraph of `range` that is prose — not a heading, not a
+/// field line.
+fn first_prose(doc: &Doc, range: &Range<usize>, known: &[&str]) -> Option<String> {
+    paragraphs_in(doc, std::slice::from_ref(range))
+        .into_iter()
+        .find(|(first, _, _)| {
+            let line = doc.lines[*first];
+            heading(line).is_none() && field_line(line, known).is_none()
+        })
+        .map(|(_, _, text)| text)
+}
+
+/// Ask candidates in `ranges`: sentences that put something to the user,
+/// each with its paragraph's span, at most [`MAX_ASKS_PER_ENTRY`].
+fn asks_in(doc: &Doc, rel: &str, ranges: &[Range<usize>]) -> Vec<(String, Span)> {
+    let mut out = Vec::new();
+    for (first, last, text) in paragraphs_in(doc, ranges) {
+        for sentence in ask_sentences(&text) {
+            if out.len() == MAX_ASKS_PER_ENTRY {
+                return out;
+            }
+            out.push((sentence, span_of(doc, rel, first, last + 1)));
+        }
+    }
+    out
+}
+
+/// Refs and cites over the text lines of `ranges`, `own` excluded.
+fn refs_and_cites(doc: &Doc, ranges: &[Range<usize>], own: &str) -> (Vec<Ref>, Vec<Cite>) {
+    let mut refs = Vec::new();
+    let mut cites = Vec::new();
+    for range in ranges {
+        for i in range.start..range.end.min(doc.lines.len()) {
+            if let Some(line) = doc.text(i) {
+                let line = strip_inline_comments(line);
+                scan_refs(&line, own, &mut refs);
+                scan_cites(&line, &mut cites);
+            }
+        }
+    }
+    (refs, cites)
+}
+
+/// Amends over the text lines of `ranges`, plus `F-037 RETRACTED` in the
+/// heading and first lines (`lead`).
+fn amends_in(doc: &Doc, ranges: &[Range<usize>], lead: &[&str], own: &str) -> Vec<Amend> {
+    let mut amends = Vec::new();
+    for range in ranges {
+        for i in range.start..range.end.min(doc.lines.len()) {
+            if let Some(line) = doc.text(i) {
+                scan_amends(line, own, &mut amends);
+            }
+        }
+    }
+    for line in lead {
+        scan_retracted_ids(line, own, &mut amends);
+    }
+    amends
+}
+
+/// The first `n` non-blank text lines of `ranges`.
+fn first_lines<'a>(doc: &Doc<'a>, ranges: &[Range<usize>], n: usize) -> Vec<&'a str> {
+    ranges
+        .iter()
+        .flat_map(|r| r.start..r.end.min(doc.lines.len()))
+        .filter_map(|i| doc.text(i))
+        .filter(|l| !l.trim().is_empty())
+        .take(n)
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1508,6 +2104,9 @@ const DECISION_FIELDS: &[&str] = &[
     "rationale",
     "consequences",
     "tags",
+    "date",
+    "status",
+    "why",
 ];
 /// Includes the fields mycelium's learning template adds that we don't show
 /// (`mitigation_type`, …) — as known labels they end the field before them
@@ -1521,18 +2120,29 @@ const LEARNING_FIELDS: &[&str] = &[
     "mitigation type",
     "structural mitigation candidate",
     "source",
+    "symptom",
+    "how to apply",
+    "generalisable rule",
+    "generalizable rule",
+    "date",
 ];
-const FINDING_FIELDS: &[&str] = &["status", "claim", "implications", "tags"];
+const FINDING_FIELDS: &[&str] = &["status", "claim", "implications", "tags", "date"];
+const TODO_FIELDS: &[&str] = &[
+    "status", "priority", "category", "author", "owner", "date", "opened", "raised", "added",
+    "tags",
+];
+const CONVENTION_FIELDS: &[&str] = &["status", "tags"];
 
 fn field_label(raw: &str) -> String {
     collapse_ws(&raw.replace('_', " ").to_lowercase())
 }
 
-/// A field-opening line: `**Label**: value` or `**Label:** value` with any
-/// label, plus — for the kind's known labels only — `- **Label**: value` and
-/// plain `Label: value` (mycelium's own tag reader accepts `Tags: x`). A
-/// blockquote prefix is tolerated, as mycelium's is.
-fn field_line<'l>(line: &'l str, known: &[&str]) -> Option<(String, &'l str)> {
+/// A field-opening line: `**Label**: value`, `**Label:** value` or a lead-in
+/// `**Label.** prose` with any label; for the kind's known labels only, also
+/// `**Label: value**`, `- **Label**: value` and plain `Label: value`
+/// (mycelium's own tag reader accepts `Tags: x`). A blockquote prefix is
+/// tolerated, as mycelium's is.
+fn field_line<'l>(line: &'l str, known: &[&str]) -> Option<(String, Cow<'l, str>)> {
     let s = line.trim_start_matches(|c: char| c == '>' || c.is_whitespace());
     let (s, bulleted) = match s.strip_prefix(['-', '*', '+']) {
         Some(rest) if rest.starts_with([' ', '\t']) => (rest.trim_start(), true),
@@ -1542,9 +2152,27 @@ fn field_line<'l>(line: &'l str, known: &[&str]) -> Option<(String, &'l str)> {
         let close = inner.find("**")?;
         let raw = &inner[..close];
         let after = &inner[close + 2..];
-        let (label, value) = match raw.strip_suffix(':') {
-            Some(label) => (label, after),
-            None => (raw, after.trim_start().strip_prefix(':')?),
+        let colon = match raw.strip_suffix(':') {
+            Some(label) => Some((label, after)),
+            None => after.trim_start().strip_prefix(':').map(|v| (raw, v)),
+        };
+        let (label, value) = if let Some((label, value)) = colon {
+            (label, Cow::Borrowed(value.trim()))
+        } else if let Some((label, inside)) = raw
+            .split_once(':')
+            .filter(|(label, _)| known.contains(&field_label(label).as_str()))
+        {
+            // `**Status: open, on purpose.**`
+            let value = format!("{}{}", inside.trim(), after);
+            (label, Cow::Owned(value.trim().to_owned()))
+        } else if let Some(label) = raw
+            .strip_suffix('.')
+            .filter(|label| !label.contains([':', '.', '!', '?']))
+        {
+            // `**Setup.** prose`, `**Why it matters.** …`: a lead-in label.
+            (label, Cow::Borrowed(after.trim()))
+        } else {
+            return None;
         };
         let label = label.trim();
         if label.is_empty() || label.len() > 48 || label.contains('*') {
@@ -1554,7 +2182,7 @@ fn field_line<'l>(line: &'l str, known: &[&str]) -> Option<(String, &'l str)> {
         if bulleted && !known.contains(&label.as_str()) {
             return None;
         }
-        return Some((label, value.trim()));
+        return Some((label, value));
     }
     if bulleted {
         return None;
@@ -1563,7 +2191,49 @@ fn field_line<'l>(line: &'l str, known: &[&str]) -> Option<(String, &'l str)> {
     let label = field_label(label);
     known
         .contains(&label.as_str())
-        .then(|| (label, value.trim()))
+        .then(|| (label, Cow::Borrowed(value.trim())))
+}
+
+/// A field line's value split where agents join several fields on one line
+/// — `**Date**: 2026-09-28 · **Status**: DECIDED · **Tags**: a, b`: at each
+/// `·` that a bold field label follows.
+fn split_inline<'l>(
+    label: String,
+    value: Cow<'l, str>,
+    known: &[&str],
+) -> Vec<(String, Cow<'l, str>)> {
+    if !value.contains('·') {
+        return vec![(label, value)];
+    }
+    match value {
+        Cow::Borrowed(v) => split_inline_str(label, v, known),
+        Cow::Owned(v) => split_inline_str(label, &v, known)
+            .into_iter()
+            .map(|(label, value)| (label, Cow::Owned(value.into_owned())))
+            .collect(),
+    }
+}
+
+fn split_inline_str<'s>(label: String, v: &'s str, known: &[&str]) -> Vec<(String, Cow<'s, str>)> {
+    let cuts: Vec<usize> = v
+        .match_indices('·')
+        .map(|(at, _)| at)
+        .filter(|&at| {
+            let next = v[at + '·'.len_utf8()..].trim_start();
+            next.starts_with("**") && field_line(next, known).is_some()
+        })
+        .collect();
+    let mut out = Vec::with_capacity(cuts.len() + 1);
+    let first_end = cuts.first().copied().unwrap_or(v.len());
+    out.push((label, Cow::Borrowed(v[..first_end].trim())));
+    for (k, &at) in cuts.iter().enumerate() {
+        let end = cuts.get(k + 1).copied().unwrap_or(v.len());
+        let segment = v[at + '·'.len_utf8()..end].trim();
+        if let Some(field) = field_line(segment, known) {
+            out.push(field);
+        }
+    }
+    out
 }
 
 /// An entry's bold fields, each with its value lines: the text after the
@@ -1602,7 +2272,13 @@ impl<'a> Fields<'a> {
                 continue;
             }
             if let Some((label, value)) = field_line(line, known) {
-                list.push((label, vec![strip_inline_comments(value)]));
+                for (label, value) in split_inline(label, value, known) {
+                    let value = match value {
+                        Cow::Borrowed(v) => strip_inline_comments(v),
+                        Cow::Owned(v) => Cow::Owned(strip_inline_comments(&v).into_owned()),
+                    };
+                    list.push((label, vec![value]));
+                }
                 current = true;
                 continue;
             }
@@ -1630,6 +2306,34 @@ impl<'a> Fields<'a> {
     fn text(&self, names: &[&str]) -> String {
         self.get(names)
             .map_or_else(String::new, |lines| cap_text(tidy(lines)))
+    }
+
+    /// The value on the label's own line.
+    fn first(&self, names: &[&str]) -> Option<&str> {
+        self.get(names)
+            .and_then(|lines| lines.first())
+            .map(|v| v.as_ref())
+    }
+
+    /// A field's first paragraph as written, markdown stripped — `stated`.
+    fn stated(&self, names: &[&str]) -> String {
+        let Some(lines) = self.get(names) else {
+            return String::new();
+        };
+        let para: Vec<&str> = lines
+            .iter()
+            .map(|l| l.as_ref())
+            .take_while(|l| !l.trim().is_empty())
+            .collect();
+        cap_text(plain(&para.join(" ")))
+    }
+
+    /// A date field's `YYYY-MM-DD`.
+    fn date(&self, names: &[&str]) -> Option<String> {
+        let value = self.first(names)?;
+        let value = plain(value);
+        let head = value.get(..10)?;
+        is_iso_date(head.as_bytes()).then(|| head.to_owned())
     }
 
     /// A list-valued field (Alternatives considered): an inline value, the
@@ -1669,9 +2373,18 @@ impl<'a> Fields<'a> {
                 parse_tags(&item.text, &mut tags);
             }
         } else {
-            // Only the label's own line: whatever follows (a `source:` note,
-            // a stray paragraph) is not tags.
+            // The label's own line, and the lines it wraps onto (a line
+            // ending in a comma continues); whatever else follows (a
+            // `source:` note, a stray paragraph) is not tags.
             parse_tags(first, &mut tags);
+            let mut prev = first.trim_end();
+            for line in rest {
+                if !prev.ends_with(',') || line.trim().is_empty() {
+                    break;
+                }
+                parse_tags(line, &mut tags);
+                prev = line.trim_end();
+            }
         }
         tags
     }
@@ -1694,8 +2407,12 @@ struct EntrySpan<'a> {
     start: usize,
     /// Exclusive.
     end: usize,
-    date: &'a str,
-    title: &'a str,
+    /// The heading's text.
+    text: &'a str,
+    /// 3, or 2 for a mislevelled legacy entry.
+    level: usize,
+    /// 1-based among the file's `###` entries: mycelium's positional N.
+    ordinal: usize,
 }
 
 struct Spans<'a> {
@@ -1715,26 +2432,147 @@ impl<'a> Spans<'a> {
     }
 }
 
+/// An explicit entry id opening `text` — `D-157`, `D1` (as `D-1`) for
+/// `letter` `D` — and the rest after its separator. The dashless form needs
+/// a real separator after it (`D1: title`, `D1 — title`) or nothing: "L2
+/// cache misses" is a title.
+fn explicit_id(text: &str, letter: u8) -> Option<(String, &str)> {
+    let t = text.trim_start().trim_start_matches('*');
+    let b = t.as_bytes();
+    if b.first() != Some(&letter) {
+        return None;
+    }
+    let dashed = b.get(1) == Some(&b'-');
+    let from = if dashed { 2 } else { 1 };
+    let digits = b[from..].iter().take_while(|c| c.is_ascii_digit()).count();
+    if digits == 0 || digits > 4 {
+        return None;
+    }
+    let end = from + digits;
+    let rest = &t[end..];
+    let separated = rest.is_empty()
+        || if dashed {
+            rest.starts_with(|c: char| {
+                c.is_whitespace() || matches!(c, ':' | '.' | '-' | '–' | '—' | ')' | '*' | ',')
+            })
+        } else {
+            rest.trim_start()
+                .starts_with([':', '.', '-', '–', '—', '*'])
+                || rest.trim().is_empty()
+        };
+    if !separated {
+        return None;
+    }
+    let rest = rest.trim_start_matches(|c: char| {
+        c.is_whitespace() || matches!(c, ':' | '.' | '-' | '–' | '—' | ')' | '*')
+    });
+    Some((format!("{}-{}", letter as char, &t[from..end]), rest))
+}
+
+/// A heading's title and its own date: a trailing `(YYYY-MM-DD)` — or a
+/// leading one right after the id (`D-47 (2026-07-24) — title`) — moves to
+/// the date. A `⛔ …` marker keeps its place at the end, and a date inside
+/// it is the marker's, not the entry's.
+fn title_and_date(text: &str) -> (String, Option<&str>) {
+    let trim = |s: &str| {
+        s.trim_matches(|c: char| c.is_whitespace() || matches!(c, ':' | '-' | '–' | '—'))
+            .to_owned()
+    };
+    let text = text.trim_start();
+    let (leading, text) = match text.strip_prefix('(') {
+        Some(inner)
+            if inner.get(..10).is_some_and(|d| is_iso_date(d.as_bytes()))
+                && inner.contains(')') =>
+        {
+            let close = inner.find(')').unwrap_or(inner.len());
+            (Some(&inner[..10]), &inner[(close + 1).min(inner.len())..])
+        }
+        _ => (None, text),
+    };
+    let (main, marker) = match text.find('⛔') {
+        Some(at) => (&text[..at], text[at..].trim()),
+        None => (text, ""),
+    };
+    let main = main.trim_end_matches(|c: char| c.is_whitespace() || matches!(c, '-' | '–' | '—'));
+    let (main, trailing) = match trailing_date(main) {
+        Some((before, date)) => (before, Some(date)),
+        None => (main, None),
+    };
+    let title = trim(main);
+    let date = leading.or(trailing);
+    if marker.is_empty() {
+        (title, date)
+    } else if title.is_empty() {
+        (marker.to_owned(), date)
+    } else {
+        (format!("{title} — {marker}"), date)
+    }
+}
+
+/// A decisions/learnings heading read two ways: `legacy` as 0.1.3 read it
+/// (the fingerprint's input, so an entry's `fp` never moves), and what
+/// agents write now — `[date] D-1: title`, `D-157 — title (date)`,
+/// `L — title`.
+struct LogHeading<'a> {
+    legacy: (&'a str, &'a str),
+    date: String,
+    id: String,
+    title: String,
+    /// `D-31 addendum (…): …`, `D-38 — REVISION`: a follow-up to the entry
+    /// with its id, not another entry with it.
+    followup: bool,
+}
+
+fn log_heading(text: &str, letter: u8) -> LogHeading<'_> {
+    let legacy = split_date_title(text);
+    let t = unbold(text);
+    let (lead, rest) = leading_date(t);
+    let rest = rest.trim_start_matches(|c: char| {
+        c.is_whitespace() || matches!(c, ':' | '-' | '–' | '—' | ']')
+    });
+    let (id, rest) = explicit_id(rest, letter).unwrap_or((String::new(), rest));
+    let followup = !id.is_empty() && followup_heading(rest).is_some();
+    // `L — title`: the kind's letter as a marker, no number.
+    let bare = rest.strip_prefix(letter as char).filter(|r| {
+        r.trim_start().starts_with(['—', '–', '-']) && r.starts_with(char::is_whitespace)
+    });
+    let rest = bare.map_or(rest, |r| {
+        r.trim_start()
+            .trim_start_matches(['—', '–', '-'])
+            .trim_start()
+    });
+    let (title, trailing) = title_and_date(rest);
+    LogHeading {
+        legacy,
+        date: lead.or(trailing).unwrap_or("").to_owned(),
+        id,
+        title,
+        followup,
+    }
+}
+
 /// Entry spans of a decisions/learnings log. `### ` at column 1 opens an
-/// entry, as in every mycelium parser; a DATED `## ` heading is a
-/// mislevelled legacy entry (pre-0.6 decision template) — accepted and
-/// counted, exactly the headings mycelium's validator flags and its
-/// migration raises. Any other `#`/`##` heading is structure: it closes the
-/// open entry and is not one.
-fn entry_spans<'a>(doc: &Doc<'a>) -> Spans<'a> {
+/// entry, as in every mycelium parser; a `## ` heading that is DATED or
+/// carries an explicit id (`## D-108 — …`) is a mislevelled legacy entry —
+/// accepted and counted (mycelium's index doesn't see it). Any other
+/// `#`/`##` heading is structure: it closes the open entry and is not one.
+fn entry_spans<'a>(doc: &Doc<'a>, letter: u8) -> Spans<'a> {
     let mut spans = Spans {
         kept: VecDeque::new(),
         total: 0,
         mislevelled: 0,
     };
     let mut open: Option<EntrySpan> = None;
+    let mut ordinal = 0usize;
     for i in 0..doc.lines.len() {
         let Some((level, text)) = doc.text(i).and_then(heading) else {
             continue;
         };
         let entry = match level {
             3 => true,
-            2 if leading_date(text).0.is_some() => {
+            2 if leading_date(unbold(text)).0.is_some()
+                || explicit_id(unbold(text), letter).is_some() =>
+            {
                 spans.mislevelled += 1;
                 true
             }
@@ -1746,12 +2584,15 @@ fn entry_spans<'a>(doc: &Doc<'a>) -> Spans<'a> {
             spans.push(span);
         }
         if entry {
-            let (date, title) = split_date_title(text);
+            if level == 3 {
+                ordinal += 1;
+            }
             open = Some(EntrySpan {
                 start: i,
                 end: 0,
-                date,
-                title,
+                text,
+                level,
+                ordinal: if level == 3 { ordinal } else { 0 },
             });
         }
     }
@@ -1762,20 +2603,29 @@ fn entry_spans<'a>(doc: &Doc<'a>) -> Spans<'a> {
     spans
 }
 
-/// Fingerprinted spans, newest first (undated last, then later-in-file
-/// first — append order is the only recency signal an undated entry has),
-/// capped to the newest [`MAX_ENTRIES`].
-fn select_entries<'a>(
+/// One entry of a log, before its kind's fields are read.
+struct LogEntry<'a> {
+    span: EntrySpan<'a>,
+    head: LogHeading<'a>,
+    fp: String,
+    /// Explicit, else positional when the file has no explicit ids.
+    id: String,
+}
+
+/// The entries of a decisions/learnings log in file order: fingerprinted
+/// (a verbatim duplicate gets `~N`), with ids.
+fn log_entries<'a>(
     doc: &Doc<'a>,
     rel: &str,
     kind: &str,
+    letter: u8,
     notes: &mut Notes,
-) -> Vec<(EntrySpan<'a>, String)> {
+) -> Vec<LogEntry<'a>> {
     let Spans {
         kept: spans,
         total,
         mislevelled,
-    } = entry_spans(doc);
+    } = entry_spans(doc, letter);
     if total > spans.len() {
         notes.push(format!(
             "{rel}: {total} entry headings; only the last {} were considered",
@@ -1792,21 +2642,57 @@ fn select_entries<'a>(
             "{rel}: {mislevelled} {verb} ## headings (mycelium 0.7 expects ###)"
         ));
     }
-    // A verbatim duplicate (same date and title) gets `~N` in file order, so
-    // an id stays unique within a read — the UI keys lists by it.
     let mut seen: HashMap<String, u32> = HashMap::new();
-    let mut entries: Vec<(usize, EntrySpan, String)> = spans
-        .into_iter()
-        .enumerate()
-        .map(|(order, span)| {
-            let base = fingerprint(kind, span.date, span.title);
-            let n = seen.entry(base.clone()).or_insert(0);
-            *n += 1;
-            let fp = if *n == 1 { base } else { format!("{base}~{n}") };
-            (order, span, fp)
-        })
-        .collect();
-    entries.sort_by(|a, b| b.1.date.cmp(a.1.date).then(b.0.cmp(&a.0)));
+    let mut entries: Vec<LogEntry> = Vec::with_capacity(spans.len());
+    for span in spans {
+        let head = log_heading(span.text, letter);
+        // A follow-up right after its entry (or that entry's earlier
+        // follow-ups) is part of it: the entry's span runs over it.
+        if head.followup {
+            if let Some(last) = entries
+                .last_mut()
+                .filter(|e| e.id == head.id && e.span.end == span.start)
+            {
+                last.span.end = span.end;
+                continue;
+            }
+        }
+        let base = fingerprint(kind, head.legacy.0, head.legacy.1);
+        let n = seen.entry(base.clone()).or_insert(0);
+        *n += 1;
+        let fp = if *n == 1 { base } else { format!("{base}~{n}") };
+        // A follow-up away from its entry keeps its heading as its title,
+        // and no id: the id is the entry's.
+        let (id, head) = if head.followup {
+            let title = unbold(span.text);
+            let title = leading_date(title).1.trim_start_matches([']', ' ']);
+            (
+                String::new(),
+                LogHeading {
+                    title: title.to_owned(),
+                    ..head
+                },
+            )
+        } else {
+            (head.id.clone(), head)
+        };
+        entries.push(LogEntry { span, head, fp, id });
+    }
+    // mycelium numbers `###` entries by position; that id means something
+    // only where no entry carries its own.
+    if entries.iter().all(|e| e.id.is_empty()) {
+        for e in entries.iter_mut().filter(|e| e.span.level == 3) {
+            e.id = format!("{}-{}", letter as char, e.span.ordinal);
+        }
+    }
+    entries
+}
+
+/// `(file order, date, entry)` newest first — undated last, then later in
+/// the file first (append order is the only recency an undated entry has)
+/// — capped to the newest [`MAX_ENTRIES`].
+fn newest_first<T>(mut entries: Vec<(usize, String, T)>, rel: &str, notes: &mut Notes) -> Vec<T> {
+    entries.sort_by(|a, b| b.1.cmp(&a.1).then(b.0.cmp(&a.0)));
     if entries.len() > MAX_ENTRIES {
         notes.push(format!(
             "{rel}: showing the newest {MAX_ENTRIES} of {} entries",
@@ -1814,76 +2700,185 @@ fn select_entries<'a>(
         ));
         entries.truncate(MAX_ENTRIES);
     }
-    entries
-        .into_iter()
-        .map(|(_, span, fp)| (span, fp))
-        .collect()
+    entries.into_iter().map(|(_, _, entry)| entry).collect()
 }
 
 fn line_no(index: usize) -> u32 {
     u32::try_from(index + 1).unwrap_or(u32::MAX)
 }
 
+/// What decisions and learnings share: span, refs, cites, the date window
+/// for asks.
+struct Common {
+    span: Span,
+    refs: Vec<Ref>,
+    cites: Vec<Cite>,
+}
+
+fn common(doc: &Doc, rel: &str, span: &EntrySpan, own: &str) -> Common {
+    let whole = span.start..span.end;
+    let (refs, cites) = refs_and_cites(doc, std::slice::from_ref(&whole), own);
+    Common {
+        span: span_of(doc, rel, span.start, span.end),
+        refs,
+        cites,
+    }
+}
+
 fn parse_decisions(text: &str, rel: &str, notes: &mut Notes) -> Vec<Decision> {
     let doc = Doc::new(text);
     doc.note_unclosed(rel, notes);
-    select_entries(&doc, rel, "decision", notes)
+    let entries = log_entries(&doc, rel, "decision", b'D', notes)
         .into_iter()
-        .map(|(span, fp)| {
+        .enumerate()
+        .map(|(order, LogEntry { span, head, fp, id })| {
             let body = span.start + 1..span.end;
+            let whole = span.start..span.end;
             let fields = Fields::parse(&doc, std::slice::from_ref(&body), DECISION_FIELDS);
-            Decision {
+            let date = if head.date.is_empty() {
+                fields.date(&["date"]).unwrap_or_default()
+            } else {
+                head.date
+            };
+            let decision = fields.text(&["decision", "decision made"]);
+            // A bare `### D-52`: the decision's first sentence, else the
+            // body's.
+            let title = if head.title.is_empty() {
+                let lead = if decision.is_empty() {
+                    first_prose(&doc, &body, DECISION_FIELDS).unwrap_or_default()
+                } else {
+                    decision.clone()
+                };
+                cap_chars(&first_sentence(&lead), MAX_TITLE_CHARS)
+            } else {
+                cap_text(head.title)
+            };
+            let Common {
+                span: at,
+                refs,
+                cites,
+            } = common(&doc, rel, &span, &id);
+            let first = first_lines(&doc, std::slice::from_ref(&body), 3);
+            let state = own_state(
+                span.text,
+                fields.first(&["status"]).unwrap_or(""),
+                &first,
+                &id,
+            );
+            let lead: Vec<&str> = std::iter::once(span.text).chain(first).collect();
+            let amends = amends_in(&doc, std::slice::from_ref(&whole), &lead, &id);
+            let rationale = match fields.text(&["rationale"]) {
+                r if r.is_empty() => fields.text(&["why"]),
+                r => r,
+            };
+            let consequences = match fields.text(&["consequences"]) {
+                c if c.is_empty() => fields.text(&["consequence"]),
+                c => c,
+            };
+            let entry = Decision {
                 fp,
-                date: span.date.to_owned(),
-                title: cap_text(span.title.to_owned()),
                 context: fields.text(&["context"]),
-                decision: fields.text(&["decision", "decision made"]),
+                decision,
                 alternatives: fields.items(&[
                     "alternatives considered",
                     "alternatives",
                     "options considered",
                 ]),
-                rationale: fields.text(&["rationale"]),
-                consequences: fields.text(&["consequences"]),
+                rationale,
+                consequences,
                 tags: fields.tags(),
                 line: line_no(span.start),
-            }
+                id,
+                stated: fields.stated(&["status"]),
+                span: Some(at),
+                refs,
+                cites,
+                pending: Pending {
+                    asks: asks_in(&doc, rel, std::slice::from_ref(&whole)),
+                    day: day_number(&date),
+                    own_state: state.is_some(),
+                    resolved: false,
+                    off_index: span.level == 2,
+                },
+                state,
+                amends,
+                title,
+                date: date.clone(),
+            };
+            (order, date, entry)
         })
-        .collect()
+        .collect();
+    newest_first(entries, rel, notes)
 }
 
 fn parse_learnings(text: &str, rel: &str, notes: &mut Notes) -> Vec<Learning> {
     let doc = Doc::new(text);
     doc.note_unclosed(rel, notes);
-    select_entries(&doc, rel, "learning", notes)
+    let entries = log_entries(&doc, rel, "learning", b'L', notes)
         .into_iter()
-        .map(|(span, fp)| {
+        .enumerate()
+        .map(|(order, LogEntry { span, head, fp, id })| {
             let body = span.start + 1..span.end;
             let fields = Fields::parse(&doc, std::slice::from_ref(&body), LEARNING_FIELDS);
+            let date = if head.date.is_empty() {
+                fields.date(&["date"]).unwrap_or_default()
+            } else {
+                head.date
+            };
             let category = fields
-                .get(&["category"])
-                .and_then(|lines| lines.first())
-                .map_or_else(|| "other".to_owned(), |v| normalize_category(v));
-            Learning {
+                .first(&["category"])
+                .map_or_else(|| "other".to_owned(), normalize_category);
+            let or_else = |first: String, then: &[&[&str]]| {
+                then.iter().fold(first, |got, names| {
+                    if got.is_empty() {
+                        fields.text(names)
+                    } else {
+                        got
+                    }
+                })
+            };
+            let Common {
+                span: at,
+                refs,
+                cites,
+            } = common(&doc, rel, &span, &id);
+            let entry = Learning {
                 fp,
-                date: span.date.to_owned(),
-                title: cap_text(span.title.to_owned()),
+                title: cap_text(head.title),
                 category,
-                what: fields.text(&["what happened", "what"]),
+                what: or_else(fields.text(&["what happened", "what"]), &[&["symptom"]]),
                 why: fields.text(&["why it matters", "why"]),
-                resolution: fields.text(&["resolution", "fix"]),
+                resolution: or_else(
+                    fields.text(&["resolution", "fix"]),
+                    &[
+                        &["how to apply"],
+                        &["generalisable rule", "generalizable rule"],
+                    ],
+                ),
                 tags: fields.tags(),
                 line: line_no(span.start),
-            }
+                id,
+                span: Some(at),
+                refs,
+                cites,
+                pending: Pending {
+                    off_index: span.level == 2,
+                    ..Pending::default()
+                },
+                date: date.clone(),
+            };
+            (order, date, entry)
         })
-        .collect()
+        .collect();
+    newest_first(entries, rel, notes)
 }
 
 // ---------------------------------------------------------------------------
 // Findings
 // ---------------------------------------------------------------------------
 
-/// `F-NNN` at the start of a heading: `(id, numeric id, claim text)`.
+/// `F-NNN` at the start of a heading: `(id, numeric id, the rest)`. A joint
+/// heading (`F-020/F-021 addendum: …`) is the first id's.
 fn finding_id(text: &str) -> Option<(String, u64, &str)> {
     let t = text.trim().trim_start_matches('*');
     let rest = t.strip_prefix("F-")?;
@@ -1893,7 +2888,14 @@ fn finding_id(text: &str) -> Option<(String, u64, &str)> {
     }
     let is_sep =
         |c: char| c.is_whitespace() || matches!(c, ':' | '.' | '-' | '–' | '—' | ')' | '*');
-    let after = &rest[digits..];
+    let mut after = &rest[digits..];
+    while let Some(more) = after.strip_prefix("/F-") {
+        let n = more.bytes().take_while(u8::is_ascii_digit).count();
+        if n == 0 {
+            return None;
+        }
+        after = &more[n..];
+    }
     if !(after.is_empty() || after.starts_with(is_sep)) {
         return None;
     }
@@ -1923,20 +2925,62 @@ fn subsection(text: &str) -> Subsection {
     }
 }
 
-/// What follows `F-NNN` in an addendum's heading — `addendum: title`,
-/// `Addendum (2) — title`, `addendum 2 - title`, a bare `addendum` — as the
-/// label to show (`Addendum (2)`) and the title. The word may carry one
-/// qualifier (parenthesized, or a token without letters), then only a
-/// separator or nothing: a claim that merely opens with the word ("Addendum
-/// to protocol v2 improves yield") is a finding.
-fn addendum_heading(rest: &str) -> Option<(String, &str)> {
-    let word = ["addendum", "addenda"]
-        .into_iter()
-        .find(|w| {
+/// The words that open a follow-up heading after `F-NNN`, and their kind.
+const FOLLOWUP_WORDS: &[(&str, &str)] = &[
+    ("addendum", "addendum"),
+    ("addenda", "addendum"),
+    ("correction", "correction"),
+    ("corrected", "correction"),
+    ("erratum", "correction"),
+    ("resolution", "resolution"),
+    ("resolved", "resolution"),
+    ("update", "update"),
+    ("updated", "update"),
+    ("revision", "update"),
+    ("revised", "update"),
+    ("reprocess", "update"),
+];
+
+/// A follow-up heading's parts.
+#[derive(Clone)]
+struct Followup<'t> {
+    /// addendum | correction | resolution | update
+    kind: &'static str,
+    /// The heading's word and qualifier: "Addendum (2)", "CORRECTION
+    /// (2026-07-23)", "Reprocess round 1", "Update".
+    label: String,
+    /// After the separator; may be empty.
+    title: &'t str,
+}
+
+/// What follows `F-NNN` in a follow-up heading — `addendum: title`,
+/// `Addendum (2) — title`, `CORRECTION (2026-07-23): title`, `RESOLVED`,
+/// `reprocess round 1 (date): title` — as its kind, label and title. The
+/// word may carry one qualifier (parenthesized, or a token without
+/// letters), then only a separator or nothing: a claim that merely opens
+/// with the word ("Addendum to protocol v2 improves yield", "Correction of
+/// batch labels…") is a finding.
+fn followup_heading(rest: &str) -> Option<Followup<'_>> {
+    let (word, kind) = FOLLOWUP_WORDS
+        .iter()
+        .filter(|(w, _)| {
             rest.get(..w.len())
                 .is_some_and(|head| head.eq_ignore_ascii_case(w))
-        })?
-        .len();
+        })
+        .max_by_key(|(w, _)| w.len())
+        .map(|&(w, kind)| (w.len(), kind))?;
+    let mut word_end = word;
+    // `reprocess round 1`: the round is part of the word.
+    if rest[..word].eq_ignore_ascii_case("reprocess") {
+        let t = rest[word..].trim_start();
+        if t.get(..5).is_some_and(|r| r.eq_ignore_ascii_case("round")) {
+            let n = t[5..].trim_start();
+            let digits = n.bytes().take_while(u8::is_ascii_digit).count();
+            if digits > 0 && t[5..].starts_with(char::is_whitespace) {
+                word_end = rest.len() - (n.len() - digits);
+            }
+        }
+    }
     // A separator and what follows it, or nothing at all.
     fn title(t: &str) -> Option<&str> {
         let t = t.trim_start().trim_start_matches('*').trim_start();
@@ -1948,7 +2992,7 @@ fn addendum_heading(rest: &str) -> Option<(String, &str)> {
                 .filter(|r| r.starts_with(char::is_whitespace))
         })
     }
-    let after = &rest[word..];
+    let after = &rest[word_end..];
     let (qualifier, title) = match title(after) {
         Some(title) => ("", title),
         None => {
@@ -1971,13 +3015,26 @@ fn addendum_heading(rest: &str) -> Option<(String, &str)> {
             (qualifier, title(tail)?)
         }
     };
-    let mut label = rest[..word].to_owned();
+    let mut label = rest[..word_end].to_owned();
     label[..1].make_ascii_uppercase();
     if !qualifier.is_empty() {
         label.push(' ');
         label.push_str(qualifier);
     }
-    Some((label, title.trim().trim_matches('*').trim()))
+    Some(Followup {
+        kind,
+        label,
+        title: title.trim().trim_matches('*').trim(),
+    })
+}
+
+/// The first `YYYY-MM-DD` anywhere in `s`.
+fn first_iso(s: &str) -> Option<&str> {
+    let b = s.as_bytes();
+    (0..b.len().saturating_sub(9))
+        .filter(|&i| s.is_char_boundary(i) && (i == 0 || !b[i - 1].is_ascii_digit()))
+        .find(|&i| is_iso_date(&b[i..i + 10]) && !b.get(i + 10).is_some_and(u8::is_ascii_digit))
+        .map(|i| &s[i..i + 10])
 }
 
 /// Where the section a heading opens ends: at the next heading above its
@@ -1994,10 +3051,27 @@ fn section_end(doc: &Doc, line: usize, level: usize, limit: usize) -> usize {
         .unwrap_or(limit)
 }
 
-/// An addendum's heading and lines, for [`parse_finding`].
+/// An `F-` heading in a topic file.
+struct Head<'t> {
+    line: usize,
+    level: usize,
+    /// The heading's text.
+    text: &'t str,
+    /// The next `F-` heading's line (or EOF): no span passes it.
+    limit: usize,
+    /// A finding's: the next finding's line (or EOF). Its span runs over
+    /// the addenda before that, which are cut out of it.
+    reach: usize,
+    id: String,
+    num: u64,
+    claim: &'t str,
+    /// A follow-up's kind, label and title.
+    followup: Option<Followup<'t>>,
+}
+
+/// A follow-up's heading and lines, for [`parse_finding`].
 struct AddendumSpan<'t> {
-    label: String,
-    title: &'t str,
+    followup: Followup<'t>,
     /// 0-based heading line.
     line: usize,
     /// Its lines after the heading.
@@ -2070,7 +3144,7 @@ fn addendum_text(doc: &Doc, body: &Range<usize>) -> String {
 }
 
 /// A topic file's findings — at most `budget` of them, the lowest ids, each
-/// with its addenda — and how many the file has in all (for the cap
+/// with its follow-ups — and how many the file has in all (for the cap
 /// warning). `None` for a file with no findings (or none left in the
 /// budget).
 fn parse_topic(
@@ -2090,25 +3164,15 @@ fn parse_topic(
             .filter(|v| !is_placeholder(v))
     };
 
-    struct Head<'t> {
-        line: usize,
-        level: usize,
-        /// The next `F-` heading's line (or EOF): no span passes it.
-        limit: usize,
-        /// A finding's: the next finding's line (or EOF). Its span runs over
-        /// the addenda before that, which are cut out of it.
-        reach: usize,
-        id: String,
-        num: u64,
-        claim: &'t str,
-        /// An addendum's label and title.
-        addendum: Option<(String, &'t str)>,
-    }
     let eof = doc.lines.len();
     let mut heads: Vec<Head> = Vec::new();
     let mut total = 0usize;
     let mut open_finding: Option<usize> = None;
     let mut title: Option<&str> = None;
+    // The level of the latest finding (not follow-up) heading with each id:
+    // a deeper heading with the id is a follow-up even without a keyword
+    // (`### F-031 recount VALIDATED on sample-a …` under `## F-031: …`).
+    let mut finding_levels: HashMap<String, usize> = HashMap::new();
     for i in 0..eof {
         let Some((level, text)) = doc.text(i).and_then(heading) else {
             continue;
@@ -2119,32 +3183,43 @@ fn parse_topic(
         let Some((id, num, claim)) = finding_id(text) else {
             continue;
         };
-        let addendum = addendum_heading(claim);
-        if !(matches!(level, 2 | 3) || (level == 4 && addendum.is_some())) {
+        let followup = followup_heading(claim).or_else(|| {
+            finding_levels
+                .get(id.as_str())
+                .is_some_and(|&at| level > at)
+                .then(|| Followup {
+                    kind: "update",
+                    label: "Update".to_owned(),
+                    title: claim,
+                })
+        });
+        if !(matches!(level, 2 | 3) || (level == 4 && followup.is_some())) {
             continue;
         }
         total += 1;
         if let Some(last) = heads.last_mut().filter(|h| h.limit == eof) {
             last.limit = i;
         }
-        if addendum.is_none() {
+        if followup.is_none() {
             if let Some(k) = open_finding.take() {
                 heads[k].reach = i;
             }
+            finding_levels.insert(id.clone(), level);
         }
         if heads.len() < MAX_SCANNED_ENTRIES {
-            if addendum.is_none() {
+            if followup.is_none() {
                 open_finding = Some(heads.len());
             }
             heads.push(Head {
                 line: i,
                 level,
+                text,
                 limit: eof,
                 reach: eof,
                 id,
                 num,
                 claim,
-                addendum,
+                followup,
             });
         }
     }
@@ -2154,14 +3229,17 @@ fn parse_topic(
         ));
     }
 
-    // Each finding with its addenda, as indexes into `heads`. An addendum
+    // Each finding with its follow-ups, as indexes into `heads`. A follow-up
     // belongs to the latest finding above it with its id; with none, it
     // leads until its finding appears (written below it) or the file ends
-    // (the finding is elsewhere, or nowhere). A reused id is two findings.
+    // (the finding is elsewhere, or nowhere). A reused id is two findings,
+    // told apart by their keys (`slug/F-038`, `slug/F-038~2`).
     struct Group {
         finding: Option<usize>,
         /// Never empty without a finding.
         addenda: Vec<usize>,
+        /// 1 for the first group with its id in this file, 2 for the next…
+        nth: usize,
     }
     impl Group {
         /// The heading the finding is shown at.
@@ -2171,31 +3249,20 @@ fn parse_topic(
     }
     let mut groups: Vec<Group> = Vec::new();
     let mut latest: HashMap<&str, usize> = HashMap::new();
+    let mut per_id: HashMap<&str, usize> = HashMap::new();
     for (k, head) in heads.iter().enumerate() {
         let group = latest.get(head.id.as_str()).map(|&g| &mut groups[g]);
-        match (head.addendum.is_some(), group) {
+        match (head.followup.is_some(), group) {
             (true, Some(group)) => group.addenda.push(k),
             (false, Some(group)) if group.finding.is_none() => group.finding = Some(k),
-            (addendum, group) => {
-                if let Some(first) = group.and_then(|g| g.finding) {
-                    notes.push(format!(
-                        "{rel}: {} at line {} reuses the id of the finding at line {}; both are shown",
-                        head.id,
-                        line_no(head.line),
-                        line_no(heads[first].line)
-                    ));
-                }
+            (followup, _) => {
+                let nth = per_id.entry(&head.id).or_insert(0);
+                *nth += 1;
                 latest.insert(&head.id, groups.len());
-                groups.push(if addendum {
-                    Group {
-                        finding: None,
-                        addenda: vec![k],
-                    }
-                } else {
-                    Group {
-                        finding: Some(k),
-                        addenda: Vec::new(),
-                    }
+                groups.push(Group {
+                    finding: (!followup).then_some(k),
+                    addenda: if followup { vec![k] } else { Vec::new() },
+                    nth: *nth,
                 });
             }
         }
@@ -2221,58 +3288,61 @@ fn parse_topic(
         .filter(|v| v.as_bytes().get(..10).is_some_and(is_iso_date))
         .map(|v| v[..10].to_owned());
     let span = |head: &Head| head.line + 1..section_end(&doc, head.line, head.level, head.limit);
+    let cx = TopicCx {
+        doc: &doc,
+        rel,
+        last_updated: last_updated.as_deref(),
+    };
     let findings = groups
         .iter()
         .map(|group| {
             let mut own = Vec::new();
-            let lead = match group.finding {
+            let (lead, end) = match group.finding {
                 Some(k) => {
                     // A `## F-` finding runs to the next `#`/`##` heading; a
                     // `### F-` one also stops at a `###` that isn't one of its
-                    // subsections. Addenda written inside it (of any id) are
-                    // cut out.
+                    // subsections. Follow-ups written inside it (of any id)
+                    // are cut out.
                     let head = &heads[k];
                     let end = section_end(&doc, head.line, head.level, head.reach);
                     let mut from = head.line + 1;
                     let inside = heads[k + 1..]
                         .iter()
-                        .take_while(|h| h.addendum.is_some() && h.line < end);
+                        .take_while(|h| h.followup.is_some() && h.line < end);
                     for inner in inside {
                         own.push(from..inner.line);
                         from = span(inner).end.min(end);
                     }
                     own.push(from..end);
-                    head
+                    (head, end)
                 }
-                // No finding in the file: the first addendum stands in for
+                // No finding in the file: the first follow-up stands in for
                 // it, its heading the claim.
-                None => &heads[group.lead()],
+                None => {
+                    let head = &heads[group.lead()];
+                    (head, span(head).end)
+                }
             };
             let parts: Vec<AddendumSpan> = group
                 .addenda
                 .iter()
                 .map(|&k| {
                     let head = &heads[k];
-                    let (label, title) = head.addendum.clone().unwrap_or_default();
                     AddendumSpan {
-                        label,
-                        title,
+                        followup: head.followup.clone().expect("a follow-up heading"),
                         line: head.line,
                         body: span(head),
                     }
                 })
                 .collect();
-            let mut finding = parse_finding(
-                &doc,
-                &own,
-                &parts,
-                &lead.id,
-                lead.claim,
-                last_updated.as_deref(),
-                notes,
-            );
-            finding.line = line_no(lead.line);
-            finding
+            let key = if group.nth == 1 {
+                format!("{slug}/{}", lead.id)
+            } else {
+                format!("{slug}/{}~{}", lead.id, group.nth)
+            };
+            let whole = lead.line..end;
+            let lead_is_finding = group.finding.is_some();
+            parse_finding(&cx, &own, &parts, lead, lead_is_finding, key, whole, notes)
         })
         .collect();
 
@@ -2285,27 +3355,39 @@ fn parse_topic(
         description: cap_text(description.to_owned()),
         path: rel.to_owned(),
         findings,
+        date: last_updated.unwrap_or_default(),
     };
     (Some(topic), found)
 }
 
-/// A finding from its own lines (`own`: its span less the addenda written
-/// inside it) and its addenda, in file order. Claim, status and
-/// implications are the finding's own; each addendum adds its tags, evidence
-/// rows and open questions — and its status, when the finding states none
-/// (the newest one stated wins) — and is listed with its text.
+/// What every finding of a topic file shares.
+struct TopicCx<'d, 'a> {
+    doc: &'d Doc<'a>,
+    rel: &'d str,
+    last_updated: Option<&'d str>,
+}
+
+/// A finding from its own lines (`own`: its span less the follow-ups
+/// written inside it) and its follow-ups, in file order. Claim, status and
+/// implications are the finding's own; each follow-up adds its tags,
+/// evidence rows and open questions — and its status, when the finding
+/// states none (the newest one stated wins) — and is listed with its text.
+#[allow(clippy::too_many_arguments)]
 fn parse_finding(
-    doc: &Doc,
+    cx: &TopicCx,
     own: &[Range<usize>],
     addenda: &[AddendumSpan],
-    id: &str,
-    heading_claim: &str,
-    last_updated: Option<&str>,
+    lead: &Head,
+    lead_is_finding: bool,
+    key: String,
+    whole: Range<usize>,
     notes: &mut Notes,
 ) -> Finding {
+    let doc = cx.doc;
+    let id = lead.id.as_str();
     let fields = Fields::parse(doc, own, FINDING_FIELDS);
-    // In file order across the finding and its addenda: ledgers append, and
-    // the newest rows are the ones kept.
+    // In file order across the finding and its follow-ups: ledgers append,
+    // and the newest rows are the ones kept.
     let mut spans: Vec<&Range<usize>> = own.iter().chain(addenda.iter().map(|a| &a.body)).collect();
     spans.sort_by_key(|span| span.start);
     let mut ledger_lines = Vec::new();
@@ -2331,7 +3413,7 @@ fn parse_finding(
     let ledger = parse_ledger(&ledger_lines);
     let updated = ledger
         .newest
-        .or_else(|| last_updated.map(str::to_owned))
+        .or_else(|| cx.last_updated.map(str::to_owned))
         .unwrap_or_default();
     if ledger.total > ledger.rows.len() {
         notes.push(format!(
@@ -2353,28 +3435,68 @@ fn parse_finding(
     }
     let questions = live_items(open, MAX_QUESTIONS_PER_FINDING);
 
-    let claim = if is_placeholder(heading_claim) {
-        fields.text(&["claim"])
+    let (heading_claim, heading_date) = title_and_date(lead.claim);
+    let claim_field = fields.text(&["claim"]);
+    let (claim, statement) = if is_placeholder(&heading_claim) {
+        (claim_field, String::new())
     } else {
-        cap_text(heading_claim.to_owned())
+        let statement = if plain(&claim_field) == plain(&heading_claim) {
+            String::new()
+        } else {
+            claim_field
+        };
+        (cap_text(heading_claim), statement)
     };
+    let date = heading_date
+        .map(str::to_owned)
+        .or_else(|| fields.date(&["date"]))
+        .unwrap_or_default();
+    let states_own = fields.get(&["status"]).is_some();
     let mut status = fields
-        .get(&["status"])
-        .and_then(|lines| lines.first())
-        .map_or_else(|| "unknown".to_owned(), |v| normalize_status(v));
-    let stated = status != "unknown";
+        .first(&["status"])
+        .map_or_else(|| "unknown".to_owned(), normalize_status);
+    let known_status = status != "unknown";
+    let mut stated = fields.stated(&["status"]);
     let mut tags = fields.tags();
-    for addendum in addenda {
+    let mut listed = Vec::with_capacity(addenda.len().min(MAX_ADDENDA));
+    let mut day = day_number(&date);
+    for (n, addendum) in addenda.iter().enumerate() {
         let its = Fields::parse(doc, std::slice::from_ref(&addendum.body), FINDING_FIELDS);
-        let said = its
-            .get(&["status"])
-            .and_then(|lines| lines.first())
-            .map(|v| normalize_status(v));
-        if let Some(said) = said.filter(|s| !stated && s != "unknown") {
+        if let Some(said) = its
+            .first(&["status"])
+            .map(normalize_status)
+            .filter(|s| !known_status && s != "unknown")
+        {
             status = said;
+        }
+        let its_stated = its.stated(&["status"]);
+        if !states_own && !its_stated.is_empty() {
+            stated.clone_from(&its_stated);
         }
         for tag in its.tags() {
             push_tag(&tag, &mut tags);
+        }
+        let followup = &addendum.followup;
+        let its_date = first_iso(&followup.label)
+            .or_else(|| paren_date(followup.title))
+            .map(str::to_owned)
+            .or_else(|| its.date(&["date"]))
+            .unwrap_or_default();
+        if let Some(d) = day_number(&its_date) {
+            day = Some(day.map_or(d, |had| had.max(d)));
+        }
+        // The newest are listed, since they append.
+        if n + MAX_ADDENDA >= addenda.len() {
+            listed.push(Addendum {
+                label: cap_text(followup.label.clone()),
+                title: cap_text(followup.title.to_owned()),
+                text: cap_text(addendum_text(doc, &addendum.body)),
+                line: line_no(addendum.line),
+                kind: followup.kind,
+                date: its_date,
+                stated: its_stated,
+                span: Some(span_of(doc, cx.rel, addendum.line, addendum.body.end)),
+            });
         }
     }
     if addenda.len() > MAX_ADDENDA {
@@ -2383,26 +3505,54 @@ fn parse_finding(
             addenda.len()
         ));
     }
-    let listed = addenda[addenda.len().saturating_sub(MAX_ADDENDA)..]
-        .iter()
-        .map(|addendum| Addendum {
-            label: cap_text(addendum.label.clone()),
-            title: cap_text(addendum.title.to_owned()),
-            text: cap_text(addendum_text(doc, &addendum.body)),
-            line: line_no(addendum.line),
-        })
-        .collect();
+
+    // Everything the finding wrote: its heading, own lines and follow-ups.
+    let mut scan: Vec<Range<usize>> = Vec::new();
+    if lead_is_finding {
+        scan.push(lead.line..lead.line + 1);
+        scan.extend(own.iter().cloned());
+    }
+    scan.extend(addenda.iter().map(|a| a.line..a.body.end));
+    scan.sort_by_key(|r| r.start);
+    let (refs, cites) = refs_and_cites(doc, &scan, id);
+    let first = first_lines(doc, own, 3);
+    let state = own_state(
+        lead.text,
+        fields.first(&["status"]).unwrap_or(""),
+        &first,
+        id,
+    );
+    let lead_lines: Vec<&str> = std::iter::once(lead.text).chain(first).collect();
+    let amends = amends_in(doc, &scan, &lead_lines, id);
     Finding {
         id: id.to_owned(),
         claim,
         status,
-        implications: fields.text(&["implications"]),
+        implications: fields.text(&["implications", "implication"]),
         tags,
         ledger: ledger.rows.into(),
         questions,
         addenda: listed,
-        line: 0,
+        line: line_no(lead.line),
         updated,
+        key,
+        stated,
+        date,
+        span: Some(span_of(doc, cx.rel, whole.start, whole.end)),
+        refs,
+        cites,
+        pending: Pending {
+            asks: asks_in(doc, cx.rel, &scan),
+            day,
+            own_state: state.is_some(),
+            resolved: addenda
+                .last()
+                .is_some_and(|a| a.followup.kind == "resolution"),
+            off_index: false,
+        },
+        state,
+        amends,
+        statement,
     }
 }
 
@@ -2514,18 +3664,29 @@ fn parse_ledger(lines: &[&str]) -> Ledger {
 // Handoff
 // ---------------------------------------------------------------------------
 
-/// Section index for a handoff heading, across both schemas
-/// `finalize_handoff.py` accepts (the five-section one and the
-/// Current State / What Was Done / Key Decisions / Next Steps / Relevant
-/// Files one). "Relevant Files" has no slot.
+/// Section index for a handoff heading, across the schemas agents write:
+/// the five-section one, `finalize_handoff.py`'s other one (Current State /
+/// What Was Done / Key Decisions / Next Steps / Relevant Files) and numbered
+/// headings (`## 1. Goal`, `## 2. Done`, `## 3. In flight`, `## 4. Next`).
+/// Goal and In flight are the current state. "Relevant Files", "Rules" and
+/// other sections have no slot (the view renders the file itself).
 fn handoff_section(text: &str) -> Option<usize> {
-    let name = collapse_ws(&text.to_lowercase().replace('&', "and"));
-    match name.trim_end_matches(':') {
-        "what was worked on" | "what was done" | "what we worked on" => Some(0),
-        "key decisions made" | "key decisions" | "decisions made" => Some(1),
+    let name = collapse_ws(&plain(text).to_lowercase().replace('&', "and"));
+    let name = name.trim_end_matches(':');
+    // `1. Goal`, `2) Done`
+    let digits = name.bytes().take_while(u8::is_ascii_digit).count();
+    let name = match name[digits..].strip_prefix(['.', ')']) {
+        Some(rest) if digits > 0 => rest.trim_start(),
+        _ => name,
+    };
+    match name {
+        "what was worked on" | "what was done" | "what we worked on" | "done" | "worked on" => {
+            Some(0)
+        }
+        "key decisions made" | "key decisions" | "decisions made" | "decisions" => Some(1),
         "blockers and surprises" | "blockers" => Some(2),
-        "current state" => Some(3),
-        "next steps" => Some(4),
+        "current state" | "goal" | "in flight" | "in-flight" => Some(3),
+        "next steps" | "next" => Some(4),
         _ => None,
     }
 }
@@ -2583,6 +3744,127 @@ fn clean_handoff(text: &str) -> String {
     out
 }
 
+/// What the handoff read yields: the chosen handoff, its asks, and the
+/// Tidy up row when the Stop hook's stub hides a hand-written one.
+#[derive(Default)]
+struct HandoffRead {
+    left: Option<LeftOff>,
+    asks: Vec<AskItem>,
+    stub: Option<Tidy>,
+}
+
+/// Whether a handoff is the Stop hook's deterministic fallback.
+fn is_stub(text: &str) -> bool {
+    text.to_lowercase().contains(STUB_LINE)
+}
+
+/// The newest handoff by mtime that says something — the shared file wins
+/// only an exact tie — plus every handoff found, newest first. At most three
+/// are read to find one with content, and the shared file once more for the
+/// stub check.
+fn read_handoff(
+    fs: &impl Fs,
+    handoffs: &[Source],
+    budget: &mut Budget,
+    notes: &mut Notes,
+) -> HandoffRead {
+    const SHARED: &str = ".mycelium/last-session.md";
+    let mut out = HandoffRead::default();
+    let mut order: Vec<&Source> = handoffs.iter().collect();
+    order.sort_by(|a, b| {
+        (b.stat.mtime_ms, b.rel == SHARED, &b.rel).cmp(&(a.stat.mtime_ms, a.rel == SHARED, &a.rel))
+    });
+    let sources: Vec<HandoffSource> = order
+        .iter()
+        .map(|s| {
+            let (session_id, host) = match &s.kind {
+                SourceKind::Handoff { session_id, host } => (session_id.clone(), host.clone()),
+                _ => (None, None),
+            };
+            HandoffSource {
+                path: s.rel.clone(),
+                written_ms: s.stat.mtime_ms,
+                session_id,
+                host,
+            }
+        })
+        .collect();
+    let mut texts: Vec<(&str, String)> = Vec::new();
+    for source in order.iter().take(3) {
+        let Some(text) = budget.read(fs, source, notes) else {
+            continue;
+        };
+        let parsed = parse_handoff(&text, source, notes);
+        texts.push((&source.rel, text));
+        let Some(mut left) = parsed else {
+            continue;
+        };
+        if let SourceKind::Handoff { session_id, host } = &source.kind {
+            left.session_id.clone_from(session_id);
+            left.host.clone_from(host);
+        }
+        let (_, text) = texts.last().expect("pushed above");
+        let doc = Doc::new(text);
+        left.span = Some(span_of(&doc, &source.rel, 0, doc.lines.len()));
+        let date = date_of_ms(source.stat.mtime_ms);
+        let all = 0..doc.lines.len();
+        let asks = asks_in(&doc, &source.rel, std::slice::from_ref(&all));
+        out.asks = asks
+            .into_iter()
+            .map(|(text, span)| AskItem {
+                text,
+                date: date.clone(),
+                source: AskSource {
+                    kind: "handoff",
+                    id: left.session_id.clone().unwrap_or_default(),
+                    key: source.rel.clone(),
+                },
+                span,
+            })
+            .collect();
+        left.sources.clone_from(&sources);
+        out.left = Some(left);
+        break;
+    }
+
+    // The shared handoff is the stub while the newest run handoff is
+    // hand-written: the Stop hook replaced what an agent wrote.
+    let shared = order.iter().find(|s| s.rel == SHARED);
+    let run = order.iter().find(|s| s.rel != SHARED);
+    if let (Some(shared), Some(run)) = (shared, run) {
+        let mut text_of = |source: &Source| -> Option<bool> {
+            if let Some((_, text)) = texts.iter().find(|(rel, _)| *rel == source.rel) {
+                return Some(is_stub(text));
+            }
+            let text = budget.read(fs, source, notes)?;
+            Some(is_stub(&text))
+        };
+        if text_of(shared) == Some(true) && text_of(run) == Some(false) {
+            let newer = if run.stat.mtime_ms > shared.stat.mtime_ms {
+                "newer "
+            } else {
+                ""
+            };
+            out.stub = Some(Tidy {
+                kind: "handoff-stub",
+                text: format!(
+                    "The shared handoff {SHARED} is the Stop hook's fallback stub, while a {newer}hand-written handoff exists at {}.",
+                    run.rel
+                ),
+                refs: Vec::new(),
+                ask: cap_bytes(
+                    format!(
+                        "{SHARED} holds only the Stop hook's fallback text (\"Completed the session work recorded in the finalized session log…\"), while {} is a hand-written handoff. Read both, then rewrite {SHARED} as a real handoff — What was worked on, Key decisions, Blockers, Current state, Next steps — carrying over what the hand-written one says is done, in flight and next. Keep {} as it is.",
+                        run.rel, run.rel
+                    ),
+                    MAX_ASK_BYTES,
+                ),
+            });
+        }
+    }
+    out
+}
+
 fn parse_handoff(text: &str, source: &Source, notes: &mut Notes) -> Option<LeftOff> {
     let cleaned = clean_handoff(text);
     let doc = Doc::new(&cleaned);
@@ -2598,6 +3880,11 @@ fn parse_handoff(text: &str, source: &Source, notes: &mut Notes) -> Option<LeftO
             Mark::Text => {
                 if let Some((level, text)) = heading(line) {
                     if let Some(slot) = handoff_section(text) {
+                        // Two sections in one slot (Goal, In flight) read as
+                        // two paragraphs.
+                        if !sections[slot].is_empty() {
+                            sections[slot].push("");
+                        }
                         current = Some((slot, level));
                         continue;
                     }
@@ -2644,8 +3931,7 @@ fn parse_handoff(text: &str, source: &Source, notes: &mut Notes) -> Option<LeftO
         next: list(&sections[4]),
         written_ms: source.stat.mtime_ms,
         path: source.rel.clone(),
-        session_id: None,
-        host: None,
+        ..LeftOff::default()
     };
     let empty = left.worked_on.is_empty()
         && left.decisions.is_empty()
@@ -2667,6 +3953,13 @@ fn parse_handoff(text: &str, source: &Source, notes: &mut Notes) -> Option<LeftO
 /// relative to `todo/`). Absolute paths, URLs, and targets that would climb
 /// out of the workspace stay verbatim.
 fn todo_path(target: &str) -> String {
+    relative_path("todo", target)
+}
+
+/// `target` as written in a file under `base`, made workspace-relative.
+/// Absolute paths, URLs, and targets that would climb out of the workspace
+/// stay verbatim.
+fn relative_path(base: &str, target: &str) -> String {
     let target = target.trim();
     let path = target.split(['#', '?']).next().unwrap_or("");
     if path.is_empty() {
@@ -2675,7 +3968,7 @@ fn todo_path(target: &str) -> String {
     if path.contains("://") || path.starts_with(['/', '~', '\\']) {
         return cap_text(target.to_owned());
     }
-    let mut parts = vec!["todo"];
+    let mut parts: Vec<&str> = base.split('/').collect();
     for part in path.split('/') {
         match part {
             "" | "." => {}
@@ -2710,13 +4003,18 @@ fn todo_columns(header: &[String]) -> Option<TodoColumns> {
     (cols[0].is_some() && (cols[1].is_some() || cols[2].is_some())).then_some(cols)
 }
 
-/// `todo/TODO_REGISTRY.md` — the `Item | Priority | Status | …` table,
-/// found by its header (mycelium's full template puts Status/Priority key
-/// tables above it). Rows are read to the next heading, NOT to the
-/// `<!-- Add new entries above this line -->` marker: mycelium 0.7.2's
-/// `upsert_table_row.py` appends new rows at the end of the file, below it.
-/// The legacy `todo/TODOLIST.md` had no schema; its list items are todos.
-fn parse_todos(text: &str, rel: &str, legacy: bool, notes: &mut Notes) -> Vec<Todo> {
+/// `todo/TODO_REGISTRY.md`: the `Item | Priority | Status | …` table, found
+/// by its header (mycelium's full template puts Status/Priority key tables
+/// above it), and the `##` to-do sections agents write below it
+/// (`## #50 — … ✅ DONE`, `## T-Name — …`). Rows are read anywhere after the
+/// header, NOT only to the `<!-- Add new entries above this line -->`
+/// marker or the next heading: mycelium 0.7.2's `upsert_table_row.py`
+/// appends new rows at the end of the file, below whatever is there — so
+/// a headerless row with the registry's width is a registry row, while
+/// another table's rows are not. The legacy `todo/TODOLIST.md` had no
+/// schema; its list items are todos. Also returns the names of the to-dos
+/// kept as sections, which the registry table doesn't list (Tidy up).
+fn parse_todos(text: &str, rel: &str, legacy: bool, notes: &mut Notes) -> (Vec<Todo>, Vec<String>) {
     let doc = Doc::new(text);
     doc.note_unclosed(rel, notes);
     if legacy {
@@ -2732,55 +4030,257 @@ fn parse_todos(text: &str, rel: &str, legacy: bool, notes: &mut Notes) -> Vec<To
         if !is_header(i) {
             return None;
         }
-        todo_columns(&cells).map(|cols| (i, cols))
+        todo_columns(&cells).map(|cols| (i, cols, cells.len()))
     });
-    let Some((header_at, cols)) = header else {
+    let Some((header_at, cols, width)) = header else {
         if legacy {
-            return legacy_todos(&doc, rel, notes);
+            return (legacy_todos(&doc, rel, notes), Vec::new());
         }
         notes.push(format!("{rel}: no Item | Priority | Status table found"));
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
 
-    let mut todos = Vec::new();
-    let mut total = 0usize;
+    #[derive(PartialEq)]
+    enum Block {
+        /// The registry table (its header, or a repeat of it).
+        Registry,
+        /// Another table: its rows are not to-dos.
+        Foreign,
+        /// Headerless rows outside any table: appended registry rows when
+        /// they have its width.
+        Loose,
+        None,
+    }
+    let mut block = Block::Registry;
+    let mut rows: Vec<(usize, Vec<String>)> = Vec::new();
+    let mut sections: Vec<usize> = Vec::new();
+    // Every `#`/`##` heading after the header: where a section ends.
+    let mut bounds: Vec<usize> = Vec::new();
     for i in header_at + 2..doc.lines.len() {
         let Some(line) = doc.text(i) else {
             continue;
         };
-        if heading(line).is_some() {
-            break;
+        if let Some((level, text)) = heading(line) {
+            block = Block::None;
+            if level <= 2 {
+                bounds.push(i);
+                if level == 2 && is_todo_section(text) {
+                    sections.push(i);
+                }
+            }
+            continue;
         }
         let Some(cells) = table_cells(line) else {
+            // A blank line ends a table; a stray line of text inside the
+            // registry doesn't.
+            if block != Block::Registry || line.trim().is_empty() {
+                block = Block::None;
+            }
             continue;
         };
         if is_separator(&cells) {
             continue;
         }
         if is_header(i) {
-            // A repeated registry header is skipped; any other table ends it.
-            if todo_columns(&cells).is_some() {
-                continue;
+            block = if todo_columns(&cells).is_some() {
+                Block::Registry
+            } else {
+                Block::Foreign
+            };
+            continue;
+        }
+        match block {
+            Block::Registry => rows.push((i, cells)),
+            Block::Foreign => {}
+            Block::Loose | Block::None => {
+                if cells.len() == width {
+                    rows.push((i, cells));
+                    block = Block::Loose;
+                } else {
+                    block = Block::Foreign;
+                }
             }
+        }
+    }
+
+    let mut todos = Vec::new();
+    let total = rows.len() + sections.len();
+    for (n, (i, cells)) in rows.iter().enumerate() {
+        if todos.len() == MAX_ENTRIES {
             break;
         }
-        let Some(todo) = todo_row(&cells, &cols) else {
-            continue;
-        };
-        total += 1;
-        if todos.len() < MAX_ENTRIES {
-            todos.push(todo);
+        todos.extend(todo_row(
+            cells,
+            &cols,
+            n + 1,
+            span_of(&doc, rel, *i, *i + 1),
+        ));
+    }
+    let mut off_index = Vec::new();
+    for (n, &start) in sections.iter().enumerate() {
+        if todos.len() == MAX_ENTRIES {
+            break;
         }
+        // A section ends at the next heading, or at a registry row appended
+        // after it.
+        let next_bound = bounds.iter().copied().find(|&b| b > start);
+        let next_row = rows.iter().map(|(i, _)| *i).find(|&i| i > start);
+        let end = [next_bound, next_row]
+            .into_iter()
+            .flatten()
+            .min()
+            .unwrap_or(doc.lines.len());
+        let todo = section_todo(&doc, rel, start, end, n + 1);
+        off_index.push(if todo.id.is_empty() {
+            format!("\"{}\"", todo.title)
+        } else {
+            todo.id.clone()
+        });
+        todos.push(todo);
     }
     if total > MAX_ENTRIES {
         notes.push(format!(
             "{rel}: showing the first {MAX_ENTRIES} of {total} todos"
         ));
     }
-    todos
+    // A repeated id keeps its key unique: `todo/#50`, `todo/#50~2`.
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    for todo in &mut todos {
+        let n = seen.entry(todo.key.clone()).or_insert(0);
+        *n += 1;
+        if *n > 1 {
+            todo.key = format!("{}~{n}", todo.key);
+        }
+    }
+    (todos, off_index)
 }
 
-fn todo_row(cells: &[String], cols: &TodoColumns) -> Option<Todo> {
+/// A `##` heading below the registry that is a to-do, not structure (a key
+/// table's or an archive's heading).
+fn is_todo_section(text: &str) -> bool {
+    let name = plain(text).to_lowercase();
+    let name = name.trim_end_matches(':').trim();
+    !(name.is_empty()
+        || name.ends_with(" key")
+        || matches!(
+            name,
+            "key" | "legend" | "registry" | "notes" | "archive" | "archived"
+        ))
+}
+
+/// A to-do id opening `text`: `#50` or `T-GroupTiers`, and the rest after
+/// its separator.
+fn todo_id(text: &str) -> Option<(String, &str)> {
+    let t = text.trim_start().trim_start_matches('*').trim_start();
+    let id = if let Some(num) = t.strip_prefix('#') {
+        let digits = num.bytes().take_while(u8::is_ascii_digit).count();
+        (digits > 0).then(|| &t[..1 + digits])?
+    } else {
+        match id_at(t, 0) {
+            Some(("todo", id)) => id,
+            _ => return None,
+        }
+    };
+    let rest = &t[id.len()..];
+    if !(rest.is_empty()
+        || rest.starts_with(|c: char| {
+            c.is_whitespace() || matches!(c, '—' | '–' | '-' | ':' | '.' | '*')
+        }))
+    {
+        return None;
+    }
+    let rest = rest.trim_start_matches(|c: char| {
+        c.is_whitespace() || matches!(c, '—' | '–' | '-' | ':' | '.' | '*')
+    });
+    Some((id.to_owned(), rest))
+}
+
+/// A section heading that says the to-do is closed: ✅, or DONE / COMPLETE
+/// as a word — but not `HALF DONE`, `NOT COMPLETE`.
+fn heading_says_closed(text: &str) -> bool {
+    if text.contains('✅') {
+        return true;
+    }
+    let mut prev = "";
+    for word in text
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+    {
+        if matches!(word, "DONE" | "COMPLETE" | "COMPLETED")
+            && !matches!(
+                prev.to_uppercase().as_str(),
+                "HALF" | "NOT" | "PARTLY" | "PARTIALLY" | "NEARLY" | "ALMOST"
+            )
+        {
+            return true;
+        }
+        prev = word;
+    }
+    false
+}
+
+/// A to-do item's lead: its bold opening when it has one (`**Build the
+/// roster stage**: …`), else its first sentence; ≤ [`MAX_TITLE_CHARS`].
+fn todo_title(item: &str) -> String {
+    let t = item.trim();
+    let lead = t
+        .strip_prefix("**")
+        .and_then(|rest| rest.find("**").map(|close| plain(&rest[..close])))
+        .filter(|lead| !lead.trim_end_matches(':').trim().is_empty());
+    let title = lead.map_or_else(
+        || first_sentence(t),
+        |l| l.trim_end_matches(':').trim().to_owned(),
+    );
+    cap_chars(&title, MAX_TITLE_CHARS)
+}
+
+/// The `##` section at `start..end` as a to-do: its heading is the item's
+/// title, its fields (`**Status**:`, `**Priority**:`, `**Opened**:`, …) the
+/// row's cells, its first paragraph the item's text.
+fn section_todo(doc: &Doc, rel: &str, start: usize, end: usize, n: usize) -> Todo {
+    let text = heading(doc.lines[start]).map_or("", |(_, text)| text);
+    let (id, rest) = todo_id(text).unwrap_or((String::new(), text));
+    let title = cap_chars(&plain(rest), MAX_TITLE_CHARS);
+    let body = start + 1..end;
+    let fields = Fields::parse(doc, std::slice::from_ref(&body), TODO_FIELDS);
+    let cell = |names: &[&str]| fields.first(names).map(plain).unwrap_or_default();
+    let status = cell(&["status"]).to_lowercase();
+    let item = match first_prose(doc, &body, TODO_FIELDS) {
+        Some(lead) => cap_text(format!("{}\n\n{lead}", plain(rest))),
+        None => cap_text(plain(rest)),
+    };
+    let whole = start..end;
+    let (refs, cites) = refs_and_cites(doc, std::slice::from_ref(&whole), &id);
+    Todo {
+        item,
+        priority: cell(&["priority"]).to_lowercase(),
+        closed: is_closed(&status) || heading_says_closed(text),
+        status: cap_text(status),
+        category: cap_text(cell(&["category"])),
+        date: fields
+            .date(&["date", "opened", "raised", "added"])
+            .unwrap_or_default(),
+        author: cap_text(cell(&["author", "owner"])),
+        file: String::new(),
+        key: if id.is_empty() {
+            format!("todo/s{n}")
+        } else {
+            format!("todo/{id}")
+        },
+        id,
+        title,
+        source: "section",
+        span: Some(span_of(doc, rel, start, end)),
+        refs,
+        cites,
+    }
+}
+
+/// A registry row as a to-do. Its File cell is a link only when it is one
+/// — a markdown link (relative to `todo/`) or a bare `item.md` (the
+/// registry's own writeups); a free-text cell ("D-117; F-198; `notes/x`")
+/// gives its ids as `refs` and its paths as `cites`, never a guessed link.
+fn todo_row(cells: &[String], cols: &TodoColumns, row: usize, span: Span) -> Option<Todo> {
     let raw = |slot: usize| {
         cols[slot]
             .and_then(|i| cells.get(i))
@@ -2792,19 +4292,44 @@ fn todo_row(cells: &[String], cols: &TodoColumns) -> Option<Todo> {
         return None;
     }
     let (_, file_link) = strip_links(raw(6));
-    let file_text = cell_text(raw(6));
+    let file_text = plain(&cell_text(raw(6)));
+    let bare_md = (!file_text.contains(char::is_whitespace)
+        && !file_text.contains('/')
+        && file_text.len() > 3
+        && file_text.ends_with(".md"))
+    .then_some(file_text);
     let file = file_link
-        .or((!file_text.is_empty()).then_some(file_text))
+        .or(bare_md)
         .or(item_link)
         .map_or_else(String::new, |target| todo_path(&target));
+    let id = todo_id(&plain(&item)).map(|(id, _)| id).unwrap_or_default();
+    let mut refs = Vec::new();
+    let mut cites = Vec::new();
+    for cell in [raw(0), raw(6)] {
+        scan_refs(cell, &id, &mut refs);
+        scan_cites(cell, &mut cites);
+    }
+    let status = plain(&cell_text(raw(2))).to_lowercase();
     Some(Todo {
+        title: todo_title(&item),
         item,
-        priority: cell_text(raw(1)).to_lowercase(),
-        status: cell_text(raw(2)).to_lowercase(),
+        priority: plain(&cell_text(raw(1))).to_lowercase(),
+        closed: is_closed(&status),
+        status,
         category: cell_text(raw(3)),
         date: cell_text(raw(4)),
         author: cell_text(raw(5)),
         file,
+        key: if id.is_empty() {
+            format!("todo/r{row}")
+        } else {
+            format!("todo/{id}")
+        },
+        id,
+        source: "table",
+        span: Some(span),
+        refs,
+        cites,
     })
 }
 
@@ -2821,16 +4346,757 @@ fn legacy_todos(doc: &Doc, rel: &str, notes: &mut Notes) -> Vec<Todo> {
         .into_iter()
         .filter(|item| !is_placeholder(&item.text))
         .take(MAX_ENTRIES)
-        .map(|item| {
+        .enumerate()
+        .map(|(n, item)| {
             let (text, link) = strip_links(&item.text);
+            let item_text = cap_text(text.trim().to_owned());
+            let status = if item.done { "complete" } else { "open" };
+            let mut refs = Vec::new();
+            scan_refs(&item.text, "", &mut refs);
             Todo {
-                item: cap_text(text.trim().to_owned()),
-                status: if item.done { "complete" } else { "open" }.to_owned(),
+                title: todo_title(&item_text),
+                item: item_text,
+                status: status.to_owned(),
+                closed: item.done,
                 file: link.map_or_else(String::new, |target| todo_path(&target)),
+                key: format!("todo/r{}", n + 1),
+                source: "table",
+                refs,
                 ..Todo::default()
             }
         })
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Conventions and sessions
+// ---------------------------------------------------------------------------
+
+/// `.living/conventions.md`: each `##` section is a convention — `## C-12 —
+/// title` (id `C-12`), or a plain `## title` without one.
+fn parse_conventions(text: &str, rel: &str, notes: &mut Notes) -> Vec<Convention> {
+    let (doc, _) = Doc::with_frontmatter(text);
+    doc.note_unclosed(rel, notes);
+    let mut heads: Vec<(usize, &str)> = Vec::new();
+    let mut bounds: Vec<usize> = Vec::new();
+    for i in 0..doc.lines.len() {
+        if let Some((level, text)) = doc.text(i).and_then(heading) {
+            if level <= 2 {
+                bounds.push(i);
+            }
+            if level == 2 {
+                heads.push((i, text));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    for (n, &(start, text)) in heads.iter().enumerate().take(MAX_CONVENTIONS) {
+        let end = bounds
+            .iter()
+            .copied()
+            .find(|&b| b > start)
+            .unwrap_or(doc.lines.len());
+        let (id, rest) = explicit_id(unbold(text), b'C').unwrap_or((String::new(), text));
+        let title = match plain(rest) {
+            t if t.is_empty() => plain(text),
+            t => t,
+        };
+        let body = start + 1..end;
+        let fields = Fields::parse(&doc, std::slice::from_ref(&body), CONVENTION_FIELDS);
+        let whole = start..end;
+        let (refs, cites) = refs_and_cites(&doc, std::slice::from_ref(&whole), &id);
+        let base = if id.is_empty() {
+            format!("conventions/s{}", n + 1)
+        } else {
+            format!("conventions/{id}")
+        };
+        let k = seen.entry(base.clone()).or_insert(0);
+        *k += 1;
+        out.push(Convention {
+            key: if *k == 1 { base } else { format!("{base}~{k}") },
+            id,
+            title: cap_text(title),
+            status: fields.stated(&["status"]),
+            span: span_of(&doc, rel, start, end),
+            refs,
+            cites,
+        });
+    }
+    if heads.len() > MAX_CONVENTIONS {
+        notes.push(format!(
+            "{rel}: showing the first {MAX_CONVENTIONS} of {} conventions",
+            heads.len()
+        ));
+    }
+    out
+}
+
+/// `.living/generated-conventions/<dir>/convention.md` (mycelium's
+/// crystallize output): its frontmatter `id`, `title` and `status`.
+fn parse_generated_convention(text: &str, rel: &str, dir: &str) -> Option<Convention> {
+    let (doc, front) = Doc::with_frontmatter(text);
+    let meta = |key: &str| {
+        front
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.trim().to_owned())
+            .filter(|v| !is_placeholder(v))
+    };
+    let heading_title = (0..doc.lines.len())
+        .find_map(|i| doc.text(i).and_then(heading).filter(|(l, _)| *l == 1))
+        .map(|(_, t)| plain(t));
+    let title = meta("title")
+        .or(heading_title)
+        .unwrap_or_else(|| dir.to_owned());
+    let all = 0..doc.lines.len();
+    let (refs, cites) = refs_and_cites(&doc, std::slice::from_ref(&all), "");
+    Some(Convention {
+        key: format!("generated-conventions/{dir}"),
+        id: meta("id").map(cap_text).unwrap_or_default(),
+        title: cap_text(title),
+        status: meta("status").map(cap_text).unwrap_or_default(),
+        span: span_of(&doc, rel, 0, doc.lines.len()),
+        refs,
+        cites,
+    })
+}
+
+/// Session log columns: date, session id, branch, duration, files changed,
+/// summary, key outputs, status, log.
+type SessionColumns = [Option<usize>; 9];
+
+fn session_columns(header: &[String]) -> Option<SessionColumns> {
+    let mut cols: SessionColumns = [None; 9];
+    for (i, cell) in header.iter().enumerate() {
+        let name = plain(cell).to_lowercase();
+        let slot = match name.as_str() {
+            "date" => 0,
+            "session id" | "session" | "id" => 1,
+            "branch" => 2,
+            "duration" => 3,
+            "files changed" | "files" => 4,
+            "summary" => 5,
+            "key outputs" | "outputs" => 6,
+            "status" => 7,
+            "log" => 8,
+            _ => continue,
+        };
+        cols[slot].get_or_insert(i);
+    }
+    (cols[0].is_some() && cols[1].is_some()).then_some(cols)
+}
+
+/// `.living/log/LOG_REGISTRY.md`'s rows, newest first.
+fn parse_sessions(text: &str, rel: &str, notes: &mut Notes) -> Vec<Session> {
+    let doc = Doc::new(text);
+    doc.note_unclosed(rel, notes);
+    let row_at = |i: usize| doc.text(i).and_then(table_cells);
+    let is_header = |i: usize| row_at(i + 1).is_some_and(|next| is_separator(&next));
+    let Some((header_at, cols, width)) = (0..doc.lines.len()).find_map(|i| {
+        let cells = row_at(i)?;
+        if !is_header(i) {
+            return None;
+        }
+        session_columns(&cells).map(|cols| (i, cols, cells.len()))
+    }) else {
+        return Vec::new();
+    };
+    let mut rows: Vec<(usize, Session)> = Vec::new();
+    for i in header_at + 2..doc.lines.len() {
+        let Some(cells) = row_at(i) else {
+            continue;
+        };
+        if is_separator(&cells) || is_header(i) || cells.len() != width {
+            continue;
+        }
+        let cell = |slot: usize| {
+            cols[slot]
+                .and_then(|i| cells.get(i))
+                .map_or_else(String::new, |c| cell_text(c))
+        };
+        let id = cell(1);
+        if id.is_empty() {
+            continue;
+        }
+        let log = cols[8]
+            .and_then(|i| cells.get(i))
+            .and_then(|c| strip_links(c).1)
+            .map_or_else(String::new, |target| relative_path(".living/log", &target));
+        rows.push((
+            i,
+            Session {
+                id,
+                date: cell(0),
+                branch: cell(2),
+                duration: cell(3),
+                files: cell(4),
+                summary: cell(5),
+                outputs: cell(6),
+                status: cell(7),
+                log,
+            },
+        ));
+    }
+    rows.sort_by(|a, b| b.1.date.cmp(&a.1.date).then(b.0.cmp(&a.0)));
+    if rows.len() > MAX_SESSIONS {
+        notes.push(format!(
+            "{rel}: showing the newest {MAX_SESSIONS} of {} sessions",
+            rows.len()
+        ));
+        rows.truncate(MAX_SESSIONS);
+    }
+    rows.into_iter().map(|(_, s)| s).collect()
+}
+
+// ---------------------------------------------------------------------------
+// The final pass: what only the whole snapshot knows
+// ---------------------------------------------------------------------------
+
+fn finish(k: &mut Knowledge, handoff: HandoffRead, todo_sections: &[String]) {
+    let HandoffRead { left, asks, stub } = handoff;
+    k.left_off = left;
+
+    // A `T-Name` is a to-do only where one has that id ("T-cell" is prose).
+    let todo_ids: HashSet<String> = k
+        .todos
+        .iter()
+        .filter(|t| t.id.starts_with("T-"))
+        .map(|t| t.id.clone())
+        .collect();
+    let keep = |refs: &mut Vec<Ref>| refs.retain(|r| r.kind != "todo" || todo_ids.contains(&r.id));
+    for f in k.topics.iter_mut().flat_map(|t| t.findings.iter_mut()) {
+        keep(&mut f.refs);
+    }
+    k.decisions.iter_mut().for_each(|d| keep(&mut d.refs));
+    k.learnings.iter_mut().for_each(|l| keep(&mut l.refs));
+    k.todos.iter_mut().for_each(|t| keep(&mut t.refs));
+    k.conventions.iter_mut().for_each(|c| keep(&mut c.refs));
+
+    apply_amends(k);
+    for f in k.topics.iter_mut().flat_map(|t| t.findings.iter_mut()) {
+        if f.state.is_none() && f.pending.resolved {
+            f.state = Some(State {
+                kind: "resolved",
+                by: None,
+            });
+        }
+    }
+    k.asks = collect_asks(k, asks);
+    k.tidy = tidy_rows(k, todo_sections, stub);
+
+    let open_todos = k.todos.iter().filter(|t| !t.closed).count();
+    k.counts = Counts {
+        findings: count(k.topics.iter().map(|t| t.findings.len()).sum()),
+        decisions: count(k.decisions.len()),
+        learnings: count(k.learnings.len()),
+        open: count(open_todos + k.questions.len()),
+        todos: count(open_todos),
+        questions: count(k.questions.len()),
+        conventions: count(k.conventions.len()),
+        sessions: count(k.sessions.len()),
+    };
+    k.id_shapes = id_shapes();
+    k.labels = labels();
+}
+
+/// What an amend makes of its target, and how strong that is: an entry
+/// another retracts reads retracted even if a third only corrected it.
+fn inverse(kind: &str) -> (&'static str, u8) {
+    match kind {
+        "retracts" => ("retracted", 3),
+        "supersedes" => ("superseded", 2),
+        _ => ("corrected", 1),
+    }
+}
+
+/// Each amend's inverse on its target: `F-178 corrects F-171` makes F-171
+/// `corrected` by F-178. A target id naming several findings resolves to
+/// the one in the amending finding's topic, else to none; a marker the
+/// target wrote itself is never overridden.
+fn apply_amends(k: &mut Knowledge) {
+    #[derive(Clone, Copy)]
+    enum Target {
+        Finding(usize, usize),
+        Decision(usize),
+    }
+    let mut findings: HashMap<&str, Vec<(usize, usize)>> = HashMap::new();
+    for (t, topic) in k.topics.iter().enumerate() {
+        for (f, finding) in topic.findings.iter().enumerate() {
+            findings.entry(&finding.id).or_default().push((t, f));
+        }
+    }
+    let mut decisions: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (d, decision) in k.decisions.iter().enumerate() {
+        if !decision.id.is_empty() {
+            decisions.entry(&decision.id).or_default().push(d);
+        }
+    }
+    let resolve = |id: &str, topic: Option<usize>| -> Option<Target> {
+        if id.starts_with("F-") {
+            let all = findings.get(id)?;
+            if let [(t, f)] = all.as_slice() {
+                return Some(Target::Finding(*t, *f));
+            }
+            let mut same = all.iter().filter(|(t, _)| Some(*t) == topic);
+            match (same.next(), same.next()) {
+                (Some(&(t, f)), None) => Some(Target::Finding(t, f)),
+                _ => None,
+            }
+        } else if id.starts_with("D-") {
+            match decisions.get(id)?.as_slice() {
+                [d] => Some(Target::Decision(*d)),
+                _ => None,
+            }
+        } else {
+            None
+        }
+    };
+    let mut hits: Vec<(Target, &'static str, u8, String)> = Vec::new();
+    for (t, topic) in k.topics.iter().enumerate() {
+        for finding in &topic.findings {
+            for amend in &finding.amends {
+                if let Some(target) = resolve(&amend.id, Some(t)) {
+                    let (kind, rank) = inverse(amend.kind);
+                    hits.push((target, kind, rank, finding.id.clone()));
+                }
+            }
+        }
+    }
+    for decision in &k.decisions {
+        for amend in &decision.amends {
+            if let Some(target) = resolve(&amend.id, None) {
+                let (kind, rank) = inverse(amend.kind);
+                hits.push((target, kind, rank, decision.id.clone()));
+            }
+        }
+    }
+    for (target, kind, rank, by) in hits {
+        let (state, own) = match target {
+            Target::Finding(t, f) => {
+                let f = &mut k.topics[t].findings[f];
+                (&mut f.state, f.pending.own_state)
+            }
+            Target::Decision(d) => {
+                let d = &mut k.decisions[d];
+                (&mut d.state, d.pending.own_state)
+            }
+        };
+        if own {
+            continue;
+        }
+        let weaker = state.as_ref().is_none_or(|s| inverse_rank(s.kind) < rank);
+        if weaker {
+            *state = Some(State {
+                kind,
+                by: (!by.is_empty()).then_some(by),
+            });
+        }
+    }
+}
+
+fn inverse_rank(kind: &str) -> u8 {
+    match kind {
+        "retracted" => 3,
+        "superseded" => 2,
+        "corrected" => 1,
+        _ => 0,
+    }
+}
+
+/// "Waiting on you": the chosen handoff's asks (any date), then those of
+/// findings and decisions dated within [`ASK_WINDOW_DAYS`] of the newest
+/// dated one — newest first, deduplicated, at most [`MAX_ASKS`].
+fn collect_asks(k: &Knowledge, handoff: Vec<AskItem>) -> Vec<AskItem> {
+    let findings = k.topics.iter().flat_map(|t| &t.findings);
+    let newest = findings
+        .clone()
+        .filter_map(|f| f.pending.day)
+        .chain(k.decisions.iter().filter_map(|d| d.pending.day))
+        .max();
+    let mut out = handoff;
+    if let Some(newest) = newest {
+        let recent = |day: Option<i64>| day.filter(|&d| d >= newest - ASK_WINDOW_DAYS);
+        let date = |day: i64| date_of_ms(u64::try_from(day).unwrap_or(0) * 86_400_000);
+        for f in findings {
+            let Some(day) = recent(f.pending.day) else {
+                continue;
+            };
+            for (text, span) in &f.pending.asks {
+                out.push(AskItem {
+                    text: text.clone(),
+                    date: date(day),
+                    source: AskSource {
+                        kind: "finding",
+                        id: f.id.clone(),
+                        key: f.key.clone(),
+                    },
+                    span: span.clone(),
+                });
+            }
+        }
+        for d in &k.decisions {
+            let Some(day) = recent(d.pending.day) else {
+                continue;
+            };
+            for (text, span) in &d.pending.asks {
+                out.push(AskItem {
+                    text: text.clone(),
+                    date: date(day),
+                    source: AskSource {
+                        kind: "decision",
+                        id: d.id.clone(),
+                        key: d.fp.clone(),
+                    },
+                    span: span.clone(),
+                });
+            }
+        }
+    }
+    // Stable: on a tie the handoff's lead.
+    out.sort_by(|a, b| b.date.cmp(&a.date));
+    let mut seen = HashSet::new();
+    out.retain(|a| seen.insert(a.text.to_lowercase()));
+    out.truncate(MAX_ASKS);
+    out
+}
+
+/// `a, b, c and 3 more` over at most `max` names.
+fn name_list(names: &[String], max: usize) -> String {
+    let shown: Vec<&str> = names.iter().take(max).map(String::as_str).collect();
+    let mut out = shown.join(", ");
+    if names.len() > max {
+        out.push_str(&format!(" and {} more", names.len() - max));
+    }
+    out
+}
+
+fn plural(n: usize, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
+}
+
+/// The Tidy up rows: factual inconsistencies in the knowledge itself,
+/// each with the request an agent would need. Never a status judgment.
+fn tidy_rows(k: &Knowledge, todo_sections: &[String], stub: Option<Tidy>) -> Vec<Tidy> {
+    let mut rows = Vec::new();
+
+    // Finding ids naming more than one finding.
+    let mut order: Vec<String> = Vec::new();
+    let mut places: HashMap<String, Vec<String>> = HashMap::new();
+    for topic in &k.topics {
+        for f in &topic.findings {
+            let at = places.entry(f.id.clone()).or_insert_with(|| {
+                order.push(f.id.clone());
+                Vec::new()
+            });
+            at.push(format!("{}:{}", topic.path, f.line));
+        }
+    }
+    let mut dup: Vec<&String> = order.iter().filter(|id| places[*id].len() > 1).collect();
+    dup.sort_by_key(|id| id[2..].parse::<u64>().unwrap_or(u64::MAX));
+    if !dup.is_empty() {
+        let ids: Vec<String> = dup.iter().map(|id| (*id).clone()).collect();
+        let details: Vec<String> = dup
+            .iter()
+            .map(|id| format!("{id} ({})", places[*id].join(", ")))
+            .collect();
+        rows.push(Tidy {
+            kind: "duplicate-id",
+            text: cap_text(format!(
+                "{} more than one finding: {}.",
+                plural(ids.len(), "finding id names", "finding ids each name"),
+                name_list(&ids, 12)
+            )),
+            refs: ids
+                .iter()
+                .take(MAX_TIDY_REFS)
+                .map(|id| Ref {
+                    kind: "finding",
+                    id: id.clone(),
+                })
+                .collect(),
+            ask: cap_bytes(
+                format!(
+                    "In .living/findings/, these finding ids each name more than one finding: {}. Keep each id on its earliest finding, give every later one the next unused F- number, and update the references to each renumbered finding in .living/ and todo/ — check which finding a reference means before changing it.",
+                    details.join("; ")
+                ),
+                MAX_ASK_BYTES,
+            ),
+        });
+    }
+
+    // Explicit decision ids naming more than one decision.
+    let mut d_order: Vec<&str> = Vec::new();
+    let mut d_lines: HashMap<&str, Vec<u32>> = HashMap::new();
+    let mut by_line: Vec<&Decision> = k.decisions.iter().collect();
+    by_line.sort_by_key(|d| d.line);
+    for d in by_line.iter().filter(|d| !d.id.is_empty()) {
+        let lines = d_lines.entry(&d.id).or_insert_with(|| {
+            d_order.push(&d.id);
+            Vec::new()
+        });
+        lines.push(d.line);
+    }
+    let d_dup: Vec<&str> = d_order
+        .into_iter()
+        .filter(|id| d_lines[id].len() > 1)
+        .collect();
+    if !d_dup.is_empty() {
+        let ids: Vec<String> = d_dup.iter().map(|id| (*id).to_owned()).collect();
+        let details: Vec<String> = d_dup
+            .iter()
+            .map(|id| {
+                let lines: Vec<String> = d_lines[id].iter().map(u32::to_string).collect();
+                format!("{id} (lines {})", lines.join(", "))
+            })
+            .collect();
+        rows.push(Tidy {
+            kind: "duplicate-id",
+            text: cap_text(format!(
+                "{} more than one decision in .living/decisions.md: {}.",
+                plural(ids.len(), "decision id heads", "decision ids each head"),
+                name_list(&ids, 12)
+            )),
+            refs: ids
+                .iter()
+                .take(MAX_TIDY_REFS)
+                .map(|id| Ref {
+                    kind: "decision",
+                    id: id.clone(),
+                })
+                .collect(),
+            ask: cap_bytes(
+                format!(
+                    "In .living/decisions.md, these decision ids each head more than one entry: {}. Keep each id on its earliest entry, give every later one the next unused D- number, and update the references to each renumbered decision in .living/ and todo/ — check which entry a reference means before changing it.",
+                    details.join("; ")
+                ),
+                MAX_ASK_BYTES,
+            ),
+        });
+    }
+
+    // To-dos kept as sections, outside the registry table.
+    if !todo_sections.is_empty() {
+        let n = todo_sections.len();
+        rows.push(Tidy {
+            kind: "off-index",
+            text: cap_text(format!(
+                "{} kept as ## sections below the registry table in todo/TODO_REGISTRY.md, not as rows in it: {}.",
+                plural(n, "to-do is", "to-dos are"),
+                name_list(todo_sections, 12)
+            )),
+            refs: todo_sections
+                .iter()
+                .filter(|name| name.starts_with("T-"))
+                .take(MAX_TIDY_REFS)
+                .map(|id| Ref {
+                    kind: "todo",
+                    id: id.clone(),
+                })
+                .collect(),
+            ask: cap_bytes(
+                format!(
+                    "todo/TODO_REGISTRY.md keeps these to-dos as ## sections below its registry table instead of as rows in it: {}. Add a registry row for each (Item, Priority, Status, Category, Date, Author, File) that summarizes it and names its section, so mycelium's registry lists it; keep each section as its writeup.",
+                    todo_sections.join(", ")
+                ),
+                MAX_ASK_BYTES,
+            ),
+        });
+    }
+
+    // Decisions and learnings written as `##` entries.
+    let mut off: Vec<(String, String)> = Vec::new();
+    for d in k.decisions.iter().filter(|d| d.pending.off_index) {
+        let name = if d.id.is_empty() { &d.title } else { &d.id };
+        off.push((name.clone(), format!(".living/decisions.md:{}", d.line)));
+    }
+    for l in k.learnings.iter().filter(|l| l.pending.off_index) {
+        let name = if l.id.is_empty() { &l.title } else { &l.id };
+        off.push((name.clone(), format!(".living/learnings.md:{}", l.line)));
+    }
+    off.sort_by(|a, b| a.1.cmp(&b.1));
+    if !off.is_empty() {
+        let names: Vec<String> = off.iter().map(|(name, _)| name.clone()).collect();
+        let details: Vec<String> = off
+            .iter()
+            .map(|(name, at)| format!("{name} ({at})"))
+            .collect();
+        let refs = k
+            .decisions
+            .iter()
+            .filter(|d| d.pending.off_index && !d.id.is_empty())
+            .map(|d| Ref {
+                kind: "decision",
+                id: d.id.clone(),
+            })
+            .chain(
+                k.learnings
+                    .iter()
+                    .filter(|l| l.pending.off_index && !l.id.is_empty())
+                    .map(|l| Ref {
+                        kind: "learning",
+                        id: l.id.clone(),
+                    }),
+            )
+            .take(MAX_TIDY_REFS)
+            .collect();
+        rows.push(Tidy {
+            kind: "off-index",
+            text: cap_text(format!(
+                "{} written as ## headings, which mycelium's index (### entries) doesn't see: {}.",
+                plural(off.len(), "entry is", "entries are"),
+                name_list(&names, 12)
+            )),
+            refs,
+            ask: cap_bytes(
+                format!(
+                    "These entries are written as ## headings, which mycelium's index and tools (### entries only) don't see: {}. Change each to a ### heading, keeping its id, title and date as written.",
+                    details.join("; ")
+                ),
+                MAX_ASK_BYTES,
+            ),
+        });
+    }
+
+    rows.extend(stub);
+
+    // Open to-dos with the same title.
+    let mut t_order: Vec<String> = Vec::new();
+    let mut same: HashMap<String, Vec<&Todo>> = HashMap::new();
+    for todo in k.todos.iter().filter(|t| !t.closed && !t.title.is_empty()) {
+        let norm = collapse_ws(&todo.title.to_lowercase());
+        same.entry(norm.clone())
+            .or_insert_with(|| {
+                t_order.push(norm);
+                Vec::new()
+            })
+            .push(todo);
+    }
+    let twins: Vec<&Vec<&Todo>> = t_order
+        .iter()
+        .map(|t| &same[t])
+        .filter(|list| list.len() > 1)
+        .collect();
+    if !twins.is_empty() {
+        let names: Vec<String> = twins
+            .iter()
+            .map(|list| format!("\"{}\" (×{})", list[0].title, list.len()))
+            .collect();
+        let details: Vec<String> = twins
+            .iter()
+            .map(|list| {
+                let lines: Vec<String> = list
+                    .iter()
+                    .map(|t| {
+                        t.span
+                            .as_ref()
+                            .map_or_else(|| t.key.clone(), |s| format!("line {}", s.line))
+                    })
+                    .collect();
+                format!("\"{}\" ({})", list[0].title, lines.join(", "))
+            })
+            .collect();
+        rows.push(Tidy {
+            kind: "duplicate-todo",
+            text: cap_text(format!(
+                "{} the same title: {}.",
+                plural(twins.len(), "pair of open to-dos has", "sets of open to-dos have"),
+                name_list(&names, 12)
+            )),
+            refs: Vec::new(),
+            ask: cap_bytes(
+                format!(
+                    "In todo/TODO_REGISTRY.md, these open to-dos have the same title: {}. Check whether each set is the same work; if so, merge them into one entry that keeps every detail and reference, otherwise make their titles say how they differ.",
+                    details.join("; ")
+                ),
+                MAX_ASK_BYTES,
+            ),
+        });
+    }
+    rows
+}
+
+/// The id shapes this plugin answers for, as JavaScript regex sources. A
+/// to-do name may open with digits (`T-07Linkage`) but needs a letter.
+fn id_shapes() -> Vec<IdShape> {
+    vec![
+        IdShape {
+            kind: "finding",
+            pattern: r"F-\d{1,4}",
+        },
+        IdShape {
+            kind: "decision",
+            pattern: r"D-\d{1,4}",
+        },
+        IdShape {
+            kind: "convention",
+            pattern: r"C-\d{1,3}",
+        },
+        IdShape {
+            kind: "learning",
+            pattern: r"L-\d{1,4}",
+        },
+        IdShape {
+            kind: "todo",
+            pattern: r"T-\d*[A-Za-z][A-Za-z0-9]*",
+        },
+    ]
+}
+
+/// The plugin's words for the Knowledge view.
+fn labels() -> Labels {
+    Labels {
+        source: "Mycelium",
+        sections: SectionLabels {
+            overview: "Overview",
+            left_off: "Where we left off",
+            asks: "Waiting on you",
+            changed: "What changed",
+            open_work: "Open work",
+            findings: "Findings",
+            decisions: "Decisions",
+            learnings: "Watch out for",
+            conventions: "Conventions",
+            todos: "To do",
+            sessions: "Sessions",
+            tidy: "Tidy up",
+        },
+        kinds: KindLabels {
+            finding: "finding",
+            decision: "decision",
+            learning: "learning",
+            convention: "convention",
+            todo: "to-do",
+            session: "session",
+        },
+        status_words: vec![
+            StatusWord {
+                word: "preliminary",
+                rank: 1,
+                tone: "neutral",
+            },
+            StatusWord {
+                word: "supported",
+                rank: 2,
+                tone: "good",
+            },
+            StatusWord {
+                word: "robust",
+                rank: 3,
+                tone: "good",
+            },
+            StatusWord {
+                word: "contradicted",
+                rank: 0,
+                tone: "bad",
+            },
+        ],
+        status_note: "The status is what the agent wrote when it recorded the finding. \
+                      Mycelium's template describes a ladder — preliminary (one evidence row), \
+                      supported (two or more that agree), robust (three or more across datasets \
+                      or projects), contradicted (any row against it) — but the agent applies \
+                      it; Chimaera shows what was written and never rates a finding.",
+    }
 }
 
 #[cfg(test)]
@@ -2844,7 +5110,7 @@ mod tests {
     use std::time::{Duration, SystemTime};
 
     /// The reader over a real tree, through `std::fs` under the host's rules.
-    fn read(root: &Path) -> Knowledge {
+    pub(super) fn read(root: &Path) -> Knowledge {
         let fs = StdFs::new(root);
         super::read(&fs, plan(&fs))
     }
@@ -2854,10 +5120,10 @@ mod tests {
     }
 
     /// A throwaway workspace root, removed on drop.
-    struct Fixture(PathBuf);
+    pub(super) struct Fixture(PathBuf);
 
     impl Fixture {
-        fn new(label: &str) -> Self {
+        pub(super) fn new(label: &str) -> Self {
             static COUNTER: AtomicU64 = AtomicU64::new(0);
             let dir = std::env::temp_dir().join(format!(
                 "chimaera-mycelium-{label}-{}-{}",
@@ -2869,15 +5135,47 @@ mod tests {
             Self(dir)
         }
 
-        fn root(&self) -> &Path {
+        pub(super) fn root(&self) -> &Path {
             &self.0
         }
 
-        fn write(&self, rel: &str, body: &str) -> &Self {
+        pub(super) fn write(&self, rel: &str, body: &str) -> &Self {
             let path = self.0.join(rel);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, body).unwrap();
             self
+        }
+
+        /// A copy of a checked-in tree under `fixtures/`.
+        pub(super) fn copy_of(label: &str, tree: &str) -> Self {
+            fn copy(from: &Path, to: &Path) {
+                for entry in std::fs::read_dir(from).unwrap() {
+                    let entry = entry.unwrap();
+                    let dest = to.join(entry.file_name());
+                    if entry.file_type().unwrap().is_dir() {
+                        std::fs::create_dir_all(&dest).unwrap();
+                        copy(&entry.path(), &dest);
+                    } else {
+                        std::fs::copy(entry.path(), &dest).unwrap();
+                    }
+                }
+            }
+            let fx = Self::new(label);
+            let from = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("fixtures")
+                .join(tree);
+            copy(&from, fx.root());
+            fx
+        }
+
+        /// The file's mtime, at `secs` since the epoch.
+        pub(super) fn set_mtime_at(&self, rel: &str, secs: u64) {
+            File::options()
+                .write(true)
+                .open(self.0.join(rel))
+                .unwrap()
+                .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(secs))
+                .unwrap();
         }
 
         fn set_mtime(&self, rel: &str, secs_ago: u64) {
@@ -3956,25 +6254,25 @@ SESSION RESUME — Last session (2026-09-15 17:40):
     fn the_finding_cap_spends_topics_in_slug_order_and_skips_the_rest() {
         let topic = |first: usize, n: usize| {
             (first..first + n)
-                .map(|id| format!("## F-{id:03}: claim {id}\n**Status:** supported\n\n"))
+                .map(|id| format!("## F-{id:04}: claim {id}\n**Status:** supported\n\n"))
                 .collect::<String>()
         };
         let fx = Fixture::new("finding-cap");
-        fx.write(".living/findings/b.md", &topic(301, 300))
-            .write(".living/findings/a.md", &topic(1, 300))
-            .write(".living/findings/c.md", &topic(601, 10));
+        fx.write(".living/findings/b.md", &topic(601, 600))
+            .write(".living/findings/a.md", &topic(1, 600))
+            .write(".living/findings/c.md", &topic(1201, 10));
         let k = read(fx.root());
         let per_topic: Vec<(&str, usize)> = k
             .topics
             .iter()
             .map(|t| (t.slug.as_str(), t.findings.len()))
             .collect();
-        assert_eq!(per_topic, [("a", 300), ("b", 100)]);
-        assert_eq!(k.topics[1].findings[99].id, "F-400");
-        assert_eq!(k.counts.findings, 400);
+        assert_eq!(per_topic, [("a", 600), ("b", 400)]);
+        assert_eq!(k.topics[1].findings[399].id, "F-1000");
+        assert_eq!(k.counts.findings, MAX_ENTRIES as u32);
         assert_eq!(
             k.warnings,
-            ["findings: showing the first 400 of 600 (1 more topic files not read)"]
+            ["findings: showing the first 1000 of 1200 (1 more topic files not read)"]
         );
     }
 
@@ -4334,27 +6632,46 @@ Seen first in the pilot.
         assert_eq!(wire(f27)["addenda"][1]["label"], "Addendum");
         assert!(wire(&findings[5]).get("addenda").is_none());
 
+        // A reused id is two findings with two keys, and one Tidy up row —
+        // not a warning.
+        let keys: Vec<&str> = findings.iter().map(|f| f.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            [
+                "data-completeness/F-027",
+                "data-completeness/F-028",
+                "data-completeness/F-038",
+                "data-completeness/F-038~2",
+                "data-completeness/F-041",
+                "data-completeness/F-050",
+                "data-completeness/F-051",
+                "data-completeness/F-060"
+            ]
+        );
         let rel = ".living/findings/data-completeness.md";
         assert_eq!(
             k.warnings,
-            [
-                format!(
-                    "{rel}: F-038 at line {} reuses the id of the finding at line {}; both are shown",
-                    line_of("## F-038: Ambient RNA correction"),
-                    line_of("## F-038: Ambient RNA is"),
-                ),
-                format!(
-                    "{rel}: the F-041 addendum at line {} has no F-041 finding in this file; shown on its own",
-                    line_of("## F-041"),
-                ),
-            ]
+            [format!(
+                "{rel}: the F-041 addendum at line {} has no F-041 finding in this file; shown on its own",
+                line_of("## F-041"),
+            )]
         );
+        assert_eq!(k.tidy.len(), 1);
+        assert_eq!(k.tidy[0].kind, "duplicate-id");
+        assert_eq!(
+            k.tidy[0].text,
+            "1 finding id names more than one finding: F-038."
+        );
+        assert!(k.tidy[0].ask.contains(&format!(
+            "F-038 ({rel}:{}, {rel}:{})",
+            line_of("## F-038: Ambient RNA is"),
+            line_of("## F-038: Ambient RNA correction")
+        )));
     }
 
     #[test]
     fn addendum_headings_and_their_bounds() {
-        let lead =
-            |rest: &str| addendum_heading(rest).map(|(label, title)| (label, title.to_owned()));
+        let lead = |rest: &str| followup_heading(rest).map(|f| (f.label, f.title.to_owned()));
         let some = |label: &str, title: &str| Some((label.to_owned(), title.to_owned()));
         assert_eq!(lead("addendum: a — b"), some("Addendum", "a — b"));
         assert_eq!(lead("Addendum (2): x"), some("Addendum (2)", "x"));
@@ -4406,4 +6723,133 @@ Seen first in the pilot.
             )]
         );
     }
+
+    /// Counts over any tree, for checking the reader against a real
+    /// project without copying it anywhere: `MYCELIUM_TREE=/path/to/project
+    /// cargo test --release probe -- --ignored --nocapture`. Prints counts,
+    /// kinds and timings only, never content.
+    #[test]
+    #[ignore = "reads MYCELIUM_TREE"]
+    fn probe_a_real_tree() {
+        let Some(root) = std::env::var_os("MYCELIUM_TREE") else {
+            return;
+        };
+        let started = std::time::Instant::now();
+        let k = read(Path::new(&root));
+        let took = started.elapsed();
+        let json = serde_json::to_vec(&k).unwrap();
+        // MYCELIUM_JSON=<file> also writes the snapshot there.
+        if let Some(out) = std::env::var_os("MYCELIUM_JSON") {
+            std::fs::write(out, &json).unwrap();
+        }
+        let findings: Vec<&Finding> = k.topics.iter().flat_map(|t| &t.findings).collect();
+        let keys: HashSet<&str> = findings.iter().map(|f| f.key.as_str()).collect();
+        let ids: HashSet<&str> = findings.iter().map(|f| f.id.as_str()).collect();
+        let n = |pred: &dyn Fn(&Finding) -> bool| findings.iter().filter(|f| pred(f)).count();
+        println!("read in {took:?}; snapshot {} bytes", json.len());
+        println!(
+            "findings {} (unique keys {}, unique ids {}); stated {}, status known {}, dated {}, refs {}, cites {}, state {}, amends {}, statement {}",
+            findings.len(),
+            keys.len(),
+            ids.len(),
+            n(&|f| !f.stated.is_empty()),
+            n(&|f| f.status != "unknown"),
+            n(&|f| !f.date.is_empty()),
+            n(&|f| !f.refs.is_empty()),
+            n(&|f| !f.cites.is_empty()),
+            n(&|f| f.state.is_some()),
+            n(&|f| !f.amends.is_empty()),
+            n(&|f| !f.statement.is_empty()),
+        );
+        let mut states: HashMap<&str, usize> = HashMap::new();
+        for f in &findings {
+            if let Some(s) = &f.state {
+                *states.entry(s.kind).or_default() += 1;
+            }
+        }
+        let mut kinds: HashMap<&str, usize> = HashMap::new();
+        for a in findings.iter().flat_map(|f| &f.addenda) {
+            *kinds.entry(a.kind).or_default() += 1;
+        }
+        println!("finding states {states:?}; follow-ups {kinds:?}");
+        let mut cite_kinds: HashMap<&str, usize> = HashMap::new();
+        for c in findings.iter().flat_map(|f| &f.cites) {
+            *cite_kinds.entry(c.kind).or_default() += 1;
+        }
+        println!("finding cites by kind {cite_kinds:?}");
+        let d = &k.decisions;
+        println!(
+            "decisions {}: with id {}, dated {}, titled {}, stated {}, state {}, amends {}, refs {}, empty decision field {}",
+            d.len(),
+            d.iter().filter(|x| !x.id.is_empty()).count(),
+            d.iter().filter(|x| !x.date.is_empty()).count(),
+            d.iter().filter(|x| !x.title.is_empty()).count(),
+            d.iter().filter(|x| !x.stated.is_empty()).count(),
+            d.iter().filter(|x| x.state.is_some()).count(),
+            d.iter().filter(|x| !x.amends.is_empty()).count(),
+            d.iter().filter(|x| !x.refs.is_empty()).count(),
+            d.iter().filter(|x| x.decision.is_empty()).count(),
+        );
+        let l = &k.learnings;
+        println!(
+            "learnings {}: with id {}, dated {}, what {}, why {}, resolution {}, tags {}",
+            l.len(),
+            l.iter().filter(|x| !x.id.is_empty()).count(),
+            l.iter().filter(|x| !x.date.is_empty()).count(),
+            l.iter().filter(|x| !x.what.is_empty()).count(),
+            l.iter().filter(|x| !x.why.is_empty()).count(),
+            l.iter().filter(|x| !x.resolution.is_empty()).count(),
+            l.iter().filter(|x| !x.tags.is_empty()).count(),
+        );
+        let t = &k.todos;
+        println!(
+            "todos {}: table {}, sections {}, closed {}, open {}, with id {}, with file {}, with refs {}",
+            t.len(),
+            t.iter().filter(|x| x.source == "table").count(),
+            t.iter().filter(|x| x.source == "section").count(),
+            t.iter().filter(|x| x.closed).count(),
+            t.iter().filter(|x| !x.closed).count(),
+            t.iter().filter(|x| !x.id.is_empty()).count(),
+            t.iter().filter(|x| !x.file.is_empty()).count(),
+            t.iter().filter(|x| !x.refs.is_empty()).count(),
+        );
+        if let Some(left) = &k.left_off {
+            println!(
+                "handoff {} ({} found); slots: worked_on {}, decisions {}, blockers {}, current {}, next {}",
+                left.path,
+                left.sources.len(),
+                !left.worked_on.is_empty(),
+                !left.decisions.is_empty(),
+                left.blockers.len(),
+                !left.current.is_empty(),
+                left.next.len()
+            );
+        }
+        let mut ask_kinds: HashMap<&str, usize> = HashMap::new();
+        for a in &k.asks {
+            *ask_kinds.entry(a.source.kind).or_default() += 1;
+        }
+        println!("asks {} by source {ask_kinds:?}", k.asks.len());
+        let tidy: Vec<(&str, usize)> = k.tidy.iter().map(|t| (t.kind, t.refs.len())).collect();
+        println!("tidy (kind, refs) {tidy:?}");
+        println!(
+            "conventions {} (with id {}), sessions {}, questions {}, guidance {}",
+            k.conventions.len(),
+            k.conventions.iter().filter(|c| !c.id.is_empty()).count(),
+            k.sessions.len(),
+            k.questions.len(),
+            k.guidance.len()
+        );
+        println!("counts {}", serde_json::to_string(&k.counts).unwrap());
+        println!("warnings {}", k.warnings.len());
+        for w in &k.warnings {
+            // Paths and counts only.
+            println!("  warning: {}", w.chars().take(160).collect::<String>());
+        }
+    }
 }
+
+/// One test per shape real projects write, and the reference tree end to
+/// end.
+#[cfg(test)]
+mod shapes;

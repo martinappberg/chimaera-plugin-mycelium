@@ -16,6 +16,7 @@ use chimaera_plugin_api::{host, Context, Entry, Plugin, Snapshot, Stat, ToolDef,
 
 mod fs;
 mod reader;
+mod scan;
 mod tools;
 
 use fs::Fs;
