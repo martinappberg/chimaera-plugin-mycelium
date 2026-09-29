@@ -2,10 +2,25 @@
 # plugin.wasm, plugin.toml and SHA256SUMS — the three files a Chimaera daemon
 # installs from (`chimaera plugin add owner/repo`, the Plugins tab, or the
 # daemon's own plugins.lock). The tag, Cargo.toml and plugin.toml must agree.
+# Run by hand (workflow_dispatch) instead, it releases plugin.toml's version and
+# creates that tag at the commit it built; it refuses a version already tagged.
+#
+# `prerelease` (by hand only) publishes a pre-release that is not "latest": a
+# daemon pinning that exact tag (a chimaera whose plugins.lock names it) can
+# install it, while the release checker of every daemon and chimaera's
+# plugin-lock bot, which read `releases/latest`, don't see it. For a manifest
+# only an unreleased chimaera can read: mark it latest once that ships
+# (`gh release edit vX.Y.Z --prerelease=false --latest`).
 name: release
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      prerelease:
+        description: "A pre-release, not latest (for a manifest only an unreleased chimaera reads)"
+        type: boolean
+        default: false
 permissions:
   contents: write
 jobs:
@@ -19,13 +34,22 @@ jobs:
       - name: versions agree
         run: |
           set -euo pipefail
-          tag="${GITHUB_REF_NAME#v}"
           crate="$(cargo pkgid | sed 's/.*[#@]//')"
           manifest="$(grep -E '^version *= *"' plugin.toml | head -1 | cut -d'"' -f2)"
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
+            tag="$manifest"
+            if git ls-remote --exit-code --tags origin "refs/tags/v$tag" >/dev/null; then
+              echo "v$tag is already tagged; bump the version to release again" >&2
+              exit 1
+            fi
+          else
+            tag="${GITHUB_REF_NAME#v}"
+          fi
           if [ "$tag" != "$crate" ] || [ "$tag" != "$manifest" ]; then
             echo "tag v$tag, Cargo.toml $crate and plugin.toml $manifest must agree" >&2
             exit 1
           fi
+          echo "TAG=v$tag" >> "$GITHUB_ENV"
       - name: build the component
         run: |
           set -euo pipefail
@@ -37,7 +61,15 @@ jobs:
       - name: publish the release
         env:
           GH_TOKEN: ${{ github.token }}
+          PRERELEASE: ${{ inputs.prerelease && 'true' || 'false' }}
         run: |
-          gh release create "$GITHUB_REF_NAME" dist/plugin.wasm dist/plugin.toml dist/SHA256SUMS \
-            --title "$GITHUB_REF_NAME" \
+          set -euo pipefail
+          extra=()
+          if [ "$PRERELEASE" = true ]; then
+            extra=(--prerelease --latest=false)
+          fi
+          gh release create "$TAG" dist/plugin.wasm dist/plugin.toml dist/SHA256SUMS \
+            --target "$GITHUB_SHA" \
+            --title "$TAG" \
+            "${extra[@]}" \
             --notes "plugin.wasm (wasm32-wasip2), plugin.toml and SHA256SUMS for Chimaera. Install: chimaera plugin add ${GITHUB_REPOSITORY}"

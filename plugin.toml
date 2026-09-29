@@ -4,7 +4,7 @@
 id = "mycelium"
 name = "Mycelium"
 # The plugin's own version: the crate's (scripts/build-plugins.sh checks).
-version = "0.2.0"
+version = "0.2.1"
 summary = "Project memory your agents record as they work — findings, decisions, learnings."
 # A few plain sentences for the card, in the plugin author's words.
 description = "Mycelium is the Arjun Raj lab's living-repository framework: as agents work they record findings with their evidence, decisions and learnings in the repository's .living/ folder, so the project remembers what was learned and why. This plugin reads those files for the Knowledge view and gives every agent two read tools, knowledge_search and knowledge_get. It never writes."
@@ -14,6 +14,13 @@ api = "0.1"
 
 [detect]
 any = [".living/INDEX.md", ".living/learnings.md", ".living/findings", "MYCELIUM.md"]
+
+# What it reads through the host: workspace files only. It never reads the
+# Timeline or the sessions. Release only once chimaera's plugin trust (which
+# reads [access]) is released: an older daemon can't parse this table.
+[access]
+timeline = "none"
+sessions = "none"
 
 [recommends]
 # What the agent-side plugin is for, in plain words (shown once above the per-agent state).
