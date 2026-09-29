@@ -32,7 +32,7 @@ The `knowledge` export returns one JSON snapshot; Chimaera passes it straight to
 | `tidy[]` | snapshot | factual inconsistencies (reused ids, to-dos kept outside the registry, a stub handoff, twin to-dos), each with the request an agent would need |
 | `id_shapes[]`, `labels`, `guidance[]` | snapshot | the id shapes chats may turn into links, the plugin's words for the view, `MYCELIUM.md` |
 
-The full contract is the "Wire spec" section of Chimaera's `docs/knowledge-redesign-plan.md`. A snapshot over 3.5 MiB (the host refuses 4 MiB) shortens long text fields, then drops cites, then the oldest learnings and decisions, and says so in `warnings`.
+The full contract is the "Wire spec" section of Chimaera's `docs/knowledge-redesign-plan.md`. A snapshot over 3.5 MiB (the host refuses 4 MiB) shortens long text fields, then drops cites, then the oldest entries of whichever section is largest until it fits, and says so in `warnings`.
 
 ## Develop
 
